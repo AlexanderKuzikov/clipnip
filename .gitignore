@@ -1,0 +1,10 @@
+/clipnip.exe
+*.log
+test/
+
+# secrets
+.env
+.env.*
+*.key
+*.pem
+credentials*
