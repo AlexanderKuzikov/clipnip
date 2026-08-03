@@ -50,11 +50,16 @@ func playlistEntries(info map[string]any) []map[string]any {
 			}
 			videoURL = "https://www.youtube.com/watch?v=" + id
 		}
+		thumb := str(e["thumbnail"])
+		if thumb == "" && id != "" {
+			// --flat-playlist не отдаёт превью; для YouTube адрес детерминирован
+			thumb = "https://i.ytimg.com/vi/" + id + "/hqdefault.jpg"
+		}
 		out = append(out, map[string]any{
 			"url":       videoURL,
 			"title":     str(e["title"]),
 			"duration":  num(e["duration"]),
-			"thumbnail": str(e["thumbnail"]),
+			"thumbnail": thumb,
 		})
 	}
 	return out

@@ -900,7 +900,6 @@
               });
               renderCard(ei);
             }
-            idx = cardData.length - 1;
           } else {
             cardData[idx] = {
               ...cardData[idx],
@@ -914,7 +913,10 @@
             };
           }
         } catch (err) {
-          cardData[idx] = { ...cardData[idx], status: 'info-error', error: err.message || 'Request failed' };
+          if (cardData[idx].status !== 'ready') {
+            cardData[idx] = { ...cardData[idx], status: 'info-error', error: err.message || 'Request failed' };
+          }
+          renderCard(idx);
         }
 
         renderCard(idx);
