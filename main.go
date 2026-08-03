@@ -87,6 +87,7 @@ func runWebView(addr string) {
 	defer w.Destroy()
 	w.SetTitle("ClipNip — Free Youtube Downloader")
 	w.SetSize(1024, 780, webview.HintNone)
+	setWindowIcon(w.Window())
 	w.Navigate("http://" + addr + "/")
 	w.Run()
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -11,7 +12,31 @@ import (
 var (
 	user32     = syscall.NewLazyDLL("user32.dll")
 	procMsgBox = user32.NewProc("MessageBoxW")
+	kernel32   = syscall.NewLazyDLL("kernel32.dll")
+	procGetModuleHandle = kernel32.NewProc("GetModuleHandleW")
+	procLoadIcon = user32.NewProc("LoadIconW")
+	procSendMessage = user32.NewProc("SendMessageW")
 )
+
+const (
+	wmSetIcon   = 0x0080
+	iconSmall   = 0
+	iconBig     = 1
+)
+
+// setWindowIcon ставит иконку приложения (ресурс #1 из exe) в заголовок окна
+// и панель задач — WebView2 сам её не наследует.
+func setWindowIcon(hwnd unsafe.Pointer) {
+	hInst, _, _ := procGetModuleHandle.Call(0)
+	icon, _, _ := procLoadIcon.Call(hInst, 1)
+	if icon == 0 {
+		log.Printf("window icon: resource #1 not found")
+		return
+	}
+	procSendMessage.Call(uintptr(hwnd), wmSetIcon, iconBig, icon)
+	procSendMessage.Call(uintptr(hwnd), wmSetIcon, iconSmall, icon)
+	log.Printf("window icon: set")
+}
 
 // msgBox показывает нативное окно с сообщением (важно: GUI-процесс без консоли).
 func msgBox(title, text string) {
