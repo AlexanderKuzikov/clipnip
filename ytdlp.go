@@ -98,6 +98,10 @@ func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 	if err != nil {
 		return err
 	}
+	// самовосстановление: антивирус мог удалить бинарники
+	if err := ensureBins(); err != nil {
+		return err
+	}
 	ytdlp := filepath.Join(dir, "yt-dlp.exe")
 
 	args = append([]string{
@@ -182,6 +186,9 @@ func parseNAInt(s string) int64 {
 }
 
 func infoJSON(url string) (map[string]any, error) {
+	if err := ensureBins(); err != nil {
+		return nil, err
+	}
 	dir, err := binDir()
 	if err != nil {
 		return nil, err

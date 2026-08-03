@@ -4,6 +4,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -244,6 +245,17 @@ func buildDownloadArgs(job *Job) []string {
 }
 
 func runDownload(job *Job) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("runDownload panic job=%s: %v", job.JobID, r)
+			job.set(func() {
+				job.Status = "error"
+				job.Stage = "error"
+				job.Error = "Internal error: " + fmt.Sprint(r)
+			})
+		}
+	}()
+
 	dir := job.DownloadDir
 	resumed := hasPartial(dir, job.JobID)
 
@@ -294,6 +306,7 @@ func runDownload(job *Job) {
 			job.Stage = "error"
 			job.Error = err.Error()
 		})
+		log.Printf("download failed job=%s url=%s: %v", job.JobID, job.URL, err)
 		return
 	}
 
@@ -310,6 +323,7 @@ func runDownload(job *Job) {
 			job.Stage = "error"
 			job.Error = "Download finished, but final file was not found"
 		})
+		log.Printf("final file not found job=%s mode=%s dir=%s", job.JobID, job.Mode, dir)
 		return
 	}
 

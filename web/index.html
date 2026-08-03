@@ -4,7 +4,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ReClip — Free Media Downloader</title>
+  <title>ClipNip — Free Youtube Downloader</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <style>
     @font-face {
@@ -67,11 +67,11 @@
     .page {
       max-width: 620px;
       margin: 0 auto;
-      padding: 60px 24px 80px;
+      padding: 20px 24px 48px;
     }
 
     .brand {
-      margin-bottom: 48px;
+      margin-bottom: 22px;
     }
 
     .brand h1 {
@@ -569,6 +569,21 @@
       transition: width 0.35s ease;
     }
 
+    .progress-fill.indeterminate {
+      width: 30%;
+      animation: indeterminate 1.2s ease-in-out infinite;
+    }
+
+    @keyframes indeterminate {
+      0% {
+        margin-left: -30%;
+      }
+
+      100% {
+        margin-left: 100%;
+      }
+    }
+
     .card-note {
       font-size: 0.64rem;
       color: var(--muted);
@@ -625,15 +640,15 @@
       <p>Free Youtube Downloader</p>
     </div>
 
+    <textarea id="urls" placeholder="Paste one or more URLs..." rows="2"></textarea>
+    <p class="hint">Multiple links? Separate with spaces, commas, or newlines.</p>
+
     <div class="settings">
       <span class="settings-label">Save to</span>
       <input id="dirInput" type="text" spellcheck="false" placeholder="%USERPROFILE%\Downloads\ClipNip">
       <button class="settings-btn" onclick="browseDir()">Browse</button>
       <div class="settings-note" id="dirNote"></div>
     </div>
-
-    <textarea id="urls" placeholder="Paste one or more URLs..." rows="2"></textarea>
-    <p class="hint">Multiple links? Separate with spaces, commas, or newlines.</p>
 
     <div class="mode-grid">
       <button class="mode-btn active" data-mode="video" onclick="setMode(this)">
@@ -750,6 +765,12 @@
       return `${m}:${String(sec).padStart(2, '0')}`;
     }
 
+    function fmtElapsed(s) {
+      const m = Math.floor(s / 60);
+      const sec = Math.floor(s % 60);
+      return `${m}:${String(sec).padStart(2, '0')}`;
+    }
+
     function esc(s) {
       const d = document.createElement('div');
       d.textContent = s ?? '';
@@ -790,8 +811,12 @@
     function renderProgress(c) {
       const progress = typeof c.progress === 'number' ? Math.max(0, Math.min(100, c.progress)) : 0;
       const percent = typeof c.progress === 'number' ? `${progress.toFixed(progress < 10 ? 1 : 0)}%` : '...';
+      const idle = progress === 0 && !c.downloadedHuman && !c.totalHuman;
 
-      let left = c.stage === 'processing' ? 'Processing...' : `Downloading ${percent}`;
+      let left;
+      if (c.stage === 'processing') left = 'Processing...';
+      else if (idle) left = 'Connecting to server...';
+      else left = `Downloading ${percent}`;
       if (c.resumed) left += ' · resumed';
 
       const details = [];
@@ -799,6 +824,9 @@
       else if (c.downloadedHuman) details.push(c.downloadedHuman);
       if (c.speedHuman) details.push(`${c.speedHuman}/s`);
       if (c.etaHuman && c.stage !== 'processing') details.push(`ETA ${c.etaHuman}`);
+      if (idle && c.elapsed) details.push(`elapsed ${c.elapsed}`);
+
+      const fillClass = idle ? 'progress-fill indeterminate' : 'progress-fill';
 
       return `
         <div class="progress-wrap">
@@ -807,7 +835,7 @@
             <span>${esc(details.join(' · '))}</span>
           </div>
           <div class="progress-track">
-            <div class="progress-fill" style="width:${progress}%"></div>
+            <div class="${fillClass}" style="width:${idle ? 30 : progress}%"></div>
           </div>
         </div>
       `;
@@ -1024,8 +1052,10 @@
           return;
         }
 
-        c.jobId = data.job_id;
-        c.resumed = !!data.resumed;
+      c.jobId = data.job_id;
+      c.resumed = !!data.resumed;
+      c.startedAt = Date.now();
+      c.elapsed = null;
 
         if (data.status === 'done') {
           c.status = 'done';
@@ -1066,6 +1096,9 @@
         c.totalHuman = data.total_human || null;
         c.speedHuman = data.speed_human || null;
         c.etaHuman = data.eta_human || null;
+        if (c.startedAt && (data.status === 'downloading' || data.status === 'processing')) {
+          c.elapsed = fmtElapsed((Date.now() - c.startedAt) / 1000);
+        }
 
         renderCard(idx);
 

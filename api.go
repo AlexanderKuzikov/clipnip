@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -131,6 +132,7 @@ func newAPI() http.Handler {
 
 		info, err := infoJSON(u)
 		if err != nil {
+			log.Printf("info failed url=%s: %v", u, err)
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}

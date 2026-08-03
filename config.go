@@ -28,6 +28,11 @@ func configPath() (string, error) {
 	return filepath.Join(dir, "config.json"), nil
 }
 
+func localAppDataDir() string {
+	base, _ := os.UserCacheDir()
+	return filepath.Join(base, "clipnip")
+}
+
 func loadConfig() {
 	path, err := configPath()
 	if err != nil {
