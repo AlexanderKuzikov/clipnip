@@ -498,5 +498,7 @@ func cancelJob(id string) bool {
 		}
 	})
 	killTreeOnCancel(job)
+	// отменил сам — хвост .part не нужен, убираем мусор
+	cleanupTempFiles(job.DownloadDir, id)
 	return true
 }
