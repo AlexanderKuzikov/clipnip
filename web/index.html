@@ -107,7 +107,7 @@
       font-size: 0.88rem;
       outline: none;
       resize: none;
-      min-height: 56px;
+      min-height: 220px;
       transition: border-color 0.25s, box-shadow 0.25s;
       margin-bottom: 6px;
     }
@@ -271,6 +271,15 @@
 
     .cards {
       margin-top: 24px;
+    }
+
+    .playlist-header {
+      font-size: 0.7rem;
+      color: var(--muted);
+      letter-spacing: 0.03em;
+      margin-bottom: 10px;
+      padding: 8px 4px;
+      border-bottom: 1px solid var(--card-border);
     }
 
     .card {
@@ -640,7 +649,7 @@
       <p>Free Youtube Downloader</p>
     </div>
 
-    <textarea id="urls" placeholder="Paste one or more URLs..." rows="2"></textarea>
+    <textarea id="urls" placeholder="Paste one or more URLs..." rows="8"></textarea>
     <p class="hint">Multiple links? Separate with spaces, commas, or newlines.</p>
 
     <div class="settings">
@@ -875,6 +884,23 @@
 
           if (!res.ok || data.error) {
             cardData[idx] = { ...cardData[idx], status: 'info-error', error: data.error || 'Could not fetch video info' };
+          } else if (data.entries && data.entries.length) {
+            renderPlaylistHeader(data.playlist_title || '', data.entries.length);
+            for (const e of data.entries) {
+              const ei = cardData.length;
+              cardData.push({
+                url: e.url,
+                status: 'ready',
+                title: e.title || 'Untitled',
+                thumbnail: e.thumbnail || '',
+                duration: e.duration,
+                uploader: '',
+                formats: [],
+                selectedFormatId: null,
+              });
+              renderCard(ei);
+            }
+            idx = cardData.length - 1;
           } else {
             cardData[idx] = {
               ...cardData[idx],
@@ -1001,6 +1027,17 @@
           ${note}
         </div>
       `;
+    }
+
+    function renderPlaylistHeader(title, count) {
+      let el = document.getElementById('playlist-header');
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'playlist-header';
+        el.className = 'playlist-header';
+        document.getElementById('cards').prepend(el);
+      }
+      el.innerHTML = `Playlist: ${esc(title || 'untitled')} · ${count} videos`;
     }
 
     function renderDownloadAll() {

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -25,6 +26,38 @@ func isAllowedURL(raw string) bool {
 		return false
 	}
 	return (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
+}
+
+var playlistURLRe = regexp.MustCompile(`(?i)(/playlist\?|/playlists/)`)
+
+func isPlaylistURL(raw string) bool {
+	return playlistURLRe.MatchString(raw)
+}
+
+func playlistEntries(info map[string]any) []map[string]any {
+	rawEntries, _ := info["entries"].([]any)
+	out := []map[string]any{}
+	for _, re := range rawEntries {
+		e, _ := re.(map[string]any)
+		if e == nil {
+			continue
+		}
+		id := str(e["id"])
+		videoURL := str(e["url"])
+		if !strings.HasPrefix(videoURL, "http") {
+			if id == "" {
+				continue
+			}
+			videoURL = "https://www.youtube.com/watch?v=" + id
+		}
+		out = append(out, map[string]any{
+			"url":       videoURL,
+			"title":     str(e["title"]),
+			"duration":  num(e["duration"]),
+			"thumbnail": str(e["thumbnail"]),
+		})
+	}
+	return out
 }
 
 func newAPI() http.Handler {
@@ -130,10 +163,20 @@ func newAPI() http.Handler {
 			return
 		}
 
-		info, err := infoJSON(u)
+		isPlaylist := isPlaylistURL(u)
+		info, err := infoJSON(u, isPlaylist)
 		if err != nil {
 			log.Printf("info failed url=%s: %v", u, err)
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+
+		if entries := playlistEntries(info); len(entries) > 0 {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"playlist":      true,
+				"playlist_title": str(info["title"]),
+				"entries":       entries,
+			})
 			return
 		}
 

@@ -185,7 +185,7 @@ func parseNAInt(s string) int64 {
 	return v
 }
 
-func infoJSON(url string) (map[string]any, error) {
+func infoJSON(url string, playlist bool) (map[string]any, error) {
 	if err := ensureBins(); err != nil {
 		return nil, err
 	}
@@ -195,7 +195,16 @@ func infoJSON(url string) (map[string]any, error) {
 	}
 	ytdlp := filepath.Join(dir, "yt-dlp.exe")
 
-	cmd := exec.Command(ytdlp, "--no-warnings", "--no-playlist", "--dump-single-json", url)
+	args := []string{"--no-warnings", "--dump-single-json"}
+	if playlist {
+		// плейлист: берём первые 100 записей, таймаут шире
+		args = append(args, "--flat-playlist", "--playlist-items", "1-100")
+	} else {
+		args = append(args, "--no-playlist")
+	}
+	args = append(args, url)
+
+	cmd := exec.Command(ytdlp, args...)
 	cmd.Env = append(os.Environ(), "PYTHONIOENCODING=utf-8")
 	cmd.SysProcAttr = noWindow()
 
@@ -208,6 +217,10 @@ func infoJSON(url string) (map[string]any, error) {
 		return nil, err
 	}
 
+	timeout := 45 * time.Second
+	if playlist {
+		timeout = 90 * time.Second
+	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 
@@ -221,7 +234,7 @@ func infoJSON(url string) (map[string]any, error) {
 			}
 			return nil, err
 		}
-	case <-time.After(45 * time.Second):
+	case <-time.After(timeout):
 		killTree(cmd.Process.Pid)
 		<-done
 		return nil, errors.New("info request timed out")
