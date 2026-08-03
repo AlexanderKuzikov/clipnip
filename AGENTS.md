@@ -22,8 +22,18 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
   - `POST /api/info` — метаданные + качества (таймаут 45 c)
   - `POST /api/download` — очередь (дедуп sha1 url|mode|format_id)
   - `GET /api/status/<id>`; `POST /api/cancel/<id>`; `GET /api/open/<id>`; `GET /api/file/<id>`
-- `jobs.go` — джобы в памяти, пул 3 воркера, чистка `.part` старше 24 ч при старте.
-- `ytdlp.go` — subprocess yt-dlp, прогресс-парсер, bootstrap, kill-tree.
+  - `GET/POST /api/settings` — папка загрузки (`download_dir` или `browse`: нативный диалог SHBrowseForFolderW)
+- `config.go` — конфиг в `%LOCALAPPDATA%\clipnip\config.json`; папка загрузки хранится там.
+- `jobs.go` — джобы в памяти, пул 3 воркера, чистка `.part` старше 24 ч при старте; имя файла — title из /api/info (фолбэк: fetchTitle, 15 c), переименование на диске с защитой от коллизий `(1)`.
+- `ytdlp.go` — subprocess yt-dlp, прогресс-парсер, распаковка из embed, kill-tree.
+- `embedded/*.gz` — gzip-архивы yt-dlp.exe и ffmpeg.exe, вшиты через `//go:embed`. Распаковка в `%LOCALAPPDATA%\clipnip\bin\` при первом запуске (ensureBins). Существующие файлы на диске не перезаписываются.
+
+## Обновление вшитых бинарников
+
+1. Скачать свежие `yt-dlp.exe` и `ffmpeg.exe` (GitHub / gyan.dev).
+2. Gzip их в `embedded/` (имена: `yt-dlp.exe.gz`, `ffmpeg.exe.gz`), например:
+   `gzip -k yt-dlp.exe && mv yt-dlp.exe.gz embedded/`
+3. Пересобрать exe. ffmpeg обновлять не обязательно (yt-dlp обновляется чаще).
 
 ## Do NOT touch
 
@@ -44,9 +54,13 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
 4. **WebView — Navigate на loopback http** (`127.0.0.1:0`), без SetHtml и без биндингов Go↔JS: весь UI ходит по fetch на тот же сервер.
 5. **CREATE_NO_WINDOW** (0x08000000, SysProcAttr) — обязателен для дочерних console-процессов (yt-dlp, taskkill) из GUI-приложения: иначе Windows показывает чёрное окно консоли.
 6. **stdout /api/info не обрезать**: полный JSON YouTube >4 КБ — буфер без лимита.
+7. **`--print` без модификатора WHEN подразумевает `--simulate`** — yt-dlp НЕ скачает. И `--print after_move:title` ТОЖЕ глушит прогресс-вывод (проверено) — имя брать из `/api/info` или тихим `yt-dlp --print title URL` до скачивания.
+8. **UI: без КАПС** — `text-transform: none`; тексты в обычном регистре (требование пользователя).
+9. **Бинарники вшиты (офлайн)**: никаких скачиваний в рантайме — GitHub/gyan.dev блокируются в РФ. Обновление — только пересборкой.
 
 ## Места хранения
 
-- Бинарники: `%LOCALAPPDATA%\clipnip\bin\` (yt-dlp.exe, ffmpeg.exe, ffprobe.exe)
-- Скачанное: `%USERPROFILE%\Downloads\ClipNip\`
+- Бинарники (распакованные): `%LOCALAPPDATA%\clipnip\bin\` (yt-dlp.exe, ffmpeg.exe)
+- Конфиг: `%LOCALAPPDATA%\clipnip\config.json`
+- Скачанное: выбранная пользователем папка (по умолчанию `%USERPROFILE%\Downloads\ClipNip\`)
 - Docker/venv отсутствуют намеренно — проект десктопный, один exe.

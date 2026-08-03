@@ -103,12 +103,23 @@ func jobID(url, mode, formatID string) string {
 	return hex.EncodeToString(h[:])[:10]
 }
 
-func downloadsDir() (string, error) {
+func defaultDownloadDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", err
+		return "."
 	}
-	dir := filepath.Join(home, "Downloads", "ClipNip")
+	return filepath.Join(home, "Downloads", "ClipNip")
+}
+
+func getEffectiveDownloadDir() string {
+	if dir := getDownloadDir(); dir != "" {
+		return dir
+	}
+	return defaultDownloadDir()
+}
+
+func downloadsDir() (string, error) {
+	dir := getEffectiveDownloadDir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
@@ -244,6 +255,12 @@ func runDownload(job *Job) {
 		job.Resumed = resumed
 	})
 
+	if job.Title == "" {
+		if title, err := fetchTitle(job.URL); err == nil {
+			job.set(func() { job.Title = title })
+		}
+	}
+
 	args := append(buildDownloadArgs(job), job.URL)
 
 	err := runYtDlp(job, args, func(st progressState) {
@@ -301,6 +318,10 @@ func runDownload(job *Job) {
 	filename := title + ext
 	cleanupTempFiles(dir, job.JobID)
 
+	if renamed, err := renameTo(final, filename); err == nil {
+		final = renamed
+	}
+
 	job.set(func() {
 		job.Status = "done"
 		job.Stage = "done"
@@ -310,6 +331,27 @@ func runDownload(job *Job) {
 		job.Speed = 0
 		job.ETA = 0
 	})
+}
+
+func renameTo(path, filename string) (string, error) {
+	dest := filepath.Join(filepath.Dir(path), filename)
+	if strings.EqualFold(dest, path) {
+		return path, nil
+	}
+	if _, err := os.Stat(dest); err == nil {
+		ext := filepath.Ext(filename)
+		base := strings.TrimSuffix(filename, ext)
+		for i := 1; ; i++ {
+			dest = filepath.Join(filepath.Dir(path), fmt.Sprintf("%s (%d)%s", base, i, ext))
+			if _, err := os.Stat(dest); os.IsNotExist(err) {
+				break
+			}
+		}
+	}
+	if err := os.Rename(path, dest); err != nil {
+		return path, err
+	}
+	return dest, nil
 }
 
 func openInExplorer(path string) error {
@@ -409,8 +451,8 @@ func sanitizeFilename(name, fallback string) string {
 	if name == "" {
 		return fallback
 	}
-	if len(name) > 120 {
-		name = name[:120]
+	if len(name) > 180 {
+		name = name[:180]
 	}
 	return strings.TrimRight(name, ". ")
 }

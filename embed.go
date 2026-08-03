@@ -5,14 +5,14 @@ import (
 	"io/fs"
 )
 
-//go:embed web
-var webDir embed.FS
+//go:embed web embedded
+var assetsDir embed.FS
 
 var webRoot fs.FS
 
 func webFiles() fs.FS {
 	if webRoot == nil {
-		sub, err := fs.Sub(webDir, "web")
+		sub, err := fs.Sub(assetsDir, "web")
 		if err != nil {
 			panic(err)
 		}

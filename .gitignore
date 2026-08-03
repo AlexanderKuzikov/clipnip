@@ -1,6 +1,5 @@
 /clipnip.exe
 *.log
-test/
 
 # secrets
 .env

@@ -6,6 +6,8 @@ import (
 	"io/fs"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -54,6 +56,59 @@ func newAPI() http.Handler {
 		w.Header().Set("Content-Type", "font/woff2")
 		w.Header().Set("Cache-Control", "public, max-age=86400")
 		w.Write(data)
+	})
+
+	mux.HandleFunc("/api/settings", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			dir := getDownloadDir()
+			if dir == "" {
+				dir = defaultDownloadDir()
+			}
+			writeJSON(w, http.StatusOK, map[string]string{"download_dir": dir})
+
+		case http.MethodPost:
+			var req struct {
+				DownloadDir string `json:"download_dir"`
+				Browse      bool   `json:"browse"`
+			}
+			json.NewDecoder(r.Body).Decode(&req)
+
+			if req.Browse {
+				chosen, err := browseFolder("Choose download folder")
+				if err != nil {
+					writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+					return
+				}
+				if chosen == "" {
+					writeJSON(w, http.StatusOK, map[string]string{"download_dir": getEffectiveDownloadDir()})
+					return
+				}
+				setDownloadDir(chosen)
+				writeJSON(w, http.StatusOK, map[string]string{"download_dir": chosen})
+				return
+			}
+
+			dir := strings.TrimSpace(req.DownloadDir)
+			if dir == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Empty path"})
+				return
+			}
+			abs, err := filepath.Abs(dir)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+			if err := os.MkdirAll(abs, 0o755); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+			setDownloadDir(abs)
+			writeJSON(w, http.StatusOK, map[string]string{"download_dir": abs})
+
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
+		}
 	})
 
 	mux.HandleFunc("/api/info", func(w http.ResponseWriter, r *http.Request) {

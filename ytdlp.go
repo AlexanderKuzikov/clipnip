@@ -1,14 +1,13 @@
 package main
 
 import (
-	"archive/zip"
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,8 +19,8 @@ import (
 )
 
 const (
-	ytdlpURL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
-	ffmpegURL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+	ytdlpGz  = "embedded/yt-dlp.exe.gz"
+	ffmpegGz = "embedded/ffmpeg.exe.gz"
 )
 
 type progressState struct {
@@ -44,93 +43,52 @@ func binDir() (string, error) {
 	return dir, nil
 }
 
+// ensureBins распаковывает yt-dlp и ffmpeg из embed при первом запуске.
+// Существующие файлы на диске не перезаписываются (ручное обновление возможно).
 func ensureBins() error {
 	dir, err := binDir()
 	if err != nil {
 		return err
 	}
-
-	ytdlp := filepath.Join(dir, "yt-dlp.exe")
-	if _, err := os.Stat(ytdlp); err != nil {
-		if err := downloadFile(ytdlp, ytdlpURL); err != nil {
-			return fmt.Errorf("yt-dlp download: %w", err)
-		}
+	if err := extractEmbedded(dir, ytdlpGz, "yt-dlp.exe"); err != nil {
+		return fmt.Errorf("yt-dlp extract: %w", err)
 	}
-
-	ffmpeg := filepath.Join(dir, "ffmpeg.exe")
-	if _, err := os.Stat(ffmpeg); err != nil {
-		if err := downloadFFmpeg(dir); err != nil {
-			return fmt.Errorf("ffmpeg download: %w", err)
-		}
+	if err := extractEmbedded(dir, ffmpegGz, "ffmpeg.exe"); err != nil {
+		return fmt.Errorf("ffmpeg extract: %w", err)
 	}
-
 	return nil
 }
 
-func downloadFile(dest, url string) error {
-	resp, err := http.Get(url)
+func extractEmbedded(dir, gzPath, destName string) error {
+	dest := filepath.Join(dir, destName)
+	if _, err := os.Stat(dest); err == nil {
+		return nil
+	}
+
+	gz, err := assetsDir.Open(gzPath)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("status %s", resp.Status)
+	defer gz.Close()
+
+	zr, err := gzip.NewReader(gz)
+	if err != nil {
+		return err
 	}
+	defer zr.Close()
 
 	tmp := dest + ".tmp"
 	out, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
-	_, err = io.Copy(out, resp.Body)
+	_, err = io.Copy(out, zr)
 	out.Close()
 	if err != nil {
 		os.Remove(tmp)
 		return err
 	}
 	return os.Rename(tmp, dest)
-}
-
-func downloadFFmpeg(dir string) error {
-	tmpZip := filepath.Join(dir, "ffmpeg.zip")
-	if err := downloadFile(tmpZip, ffmpegURL); err != nil {
-		return err
-	}
-	defer os.Remove(tmpZip)
-
-	zr, err := zip.OpenReader(tmpZip)
-	if err != nil {
-		return err
-	}
-	defer zr.Close()
-
-	want := map[string]bool{"ffmpeg.exe": true, "ffprobe.exe": true}
-	for _, f := range zr.File {
-		name := filepath.Base(f.Name)
-		if !want[name] {
-			continue
-		}
-		rc, err := f.Open()
-		if err != nil {
-			return err
-		}
-		dst, err := os.Create(filepath.Join(dir, name))
-		if err != nil {
-			rc.Close()
-			return err
-		}
-		_, err = io.Copy(dst, rc)
-		rc.Close()
-		dst.Close()
-		if err != nil {
-			return err
-		}
-		delete(want, name)
-	}
-	if len(want) > 0 {
-		return errors.New("ffmpeg.zip: required binaries not found")
-	}
-	return nil
 }
 
 var progressTemplate = "download:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s"
@@ -267,6 +225,37 @@ func infoJSON(url string) (map[string]any, error) {
 		return nil, fmt.Errorf("parse info json: %w", err)
 	}
 	return info, nil
+}
+
+// fetchTitle получает название клипа отдельным тихим вызовом (без скачивания).
+func fetchTitle(url string) (string, error) {
+	dir, err := binDir()
+	if err != nil {
+		return "", err
+	}
+	ytdlp := filepath.Join(dir, "yt-dlp.exe")
+
+	cmd := exec.Command(ytdlp, "--no-warnings", "--no-playlist", "--print", "title", url)
+	cmd.Env = append(os.Environ(), "PYTHONIOENCODING=utf-8")
+	cmd.SysProcAttr = noWindow()
+
+	var outBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = io.Discard
+
+	if err := cmd.Start(); err != nil {
+		return "", err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		killTree(cmd.Process.Pid)
+		<-done
+	}
+	return strings.TrimSpace(outBuf.String()), nil
 }
 
 func noWindow() *syscall.SysProcAttr {

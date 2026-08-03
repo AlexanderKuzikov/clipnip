@@ -93,7 +93,7 @@
       font-size: 0.78rem;
       color: var(--muted);
       letter-spacing: 0.04em;
-      text-transform: uppercase;
+      text-transform: none;
     }
 
     textarea {
@@ -126,6 +126,61 @@
       color: var(--muted);
       margin-bottom: 18px;
       letter-spacing: 0.02em;
+    }
+
+    .settings {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 14px;
+      flex-wrap: wrap;
+    }
+
+    .settings-label {
+      font-size: 0.72rem;
+      color: var(--muted);
+      letter-spacing: 0.03em;
+      flex-shrink: 0;
+    }
+
+    .settings input {
+      flex: 1;
+      min-width: 200px;
+      padding: 8px 12px;
+      border: 1.5px solid var(--card-border);
+      border-radius: 8px;
+      background: var(--card);
+      color: var(--fg);
+      font-family: 'PT Mono', monospace;
+      font-size: 0.72rem;
+      outline: none;
+    }
+
+    .settings input:focus {
+      border-color: var(--accent);
+    }
+
+    .settings-btn {
+      padding: 8px 14px;
+      border: 1.5px solid var(--card-border);
+      border-radius: 8px;
+      background: var(--card);
+      color: var(--fg);
+      font-family: 'PT Mono', monospace;
+      font-size: 0.7rem;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .settings-btn:hover {
+      border-color: var(--muted);
+    }
+
+    .settings-note {
+      width: 100%;
+      font-size: 0.64rem;
+      color: var(--muted);
+      min-height: 1em;
     }
 
     .mode-grid {
@@ -164,7 +219,7 @@
       font-family: 'PT Mono', monospace;
       font-size: 0.78rem;
       letter-spacing: 0.04em;
-      text-transform: uppercase;
+      text-transform: none;
       margin-bottom: 6px;
     }
 
@@ -173,7 +228,7 @@
       font-size: 0.66rem;
       line-height: 1.45;
       color: var(--muted);
-      text-transform: uppercase;
+      text-transform: none;
       letter-spacing: 0.02em;
     }
 
@@ -197,7 +252,7 @@
       cursor: pointer;
       transition: background 0.2s, transform 0.1s;
       letter-spacing: 0.04em;
-      text-transform: uppercase;
+      text-transform: none;
     }
 
     .fetch-btn:hover {
@@ -331,7 +386,7 @@
       font-size: 0.68rem;
       color: var(--muted);
       letter-spacing: 0.03em;
-      text-transform: uppercase;
+      text-transform: none;
       margin-bottom: 6px;
     }
 
@@ -339,7 +394,7 @@
       font-size: 0.63rem;
       color: var(--muted);
       letter-spacing: 0.03em;
-      text-transform: uppercase;
+      text-transform: none;
       margin-bottom: 8px;
     }
 
@@ -363,7 +418,7 @@
       cursor: pointer;
       transition: all 0.2s;
       letter-spacing: 0.03em;
-      text-transform: uppercase;
+      text-transform: none;
     }
 
     .card-dl-btn:hover {
@@ -468,7 +523,7 @@
       cursor: pointer;
       transition: all 0.2s;
       letter-spacing: 0.04em;
-      text-transform: uppercase;
+      text-transform: none;
     }
 
     .dl-all-btn:hover {
@@ -493,7 +548,7 @@
       font-size: 0.64rem;
       color: var(--muted);
       letter-spacing: 0.02em;
-      text-transform: uppercase;
+      text-transform: none;
       line-height: 1.5;
       width: 100%;
     }
@@ -519,7 +574,7 @@
       color: var(--muted);
       margin-top: 6px;
       letter-spacing: 0.02em;
-      text-transform: uppercase;
+      text-transform: none;
     }
 
     .footer {
@@ -528,7 +583,7 @@
       font-size: 0.68rem;
       color: var(--muted);
       letter-spacing: 0.05em;
-      text-transform: uppercase;
+      text-transform: none;
       line-height: 1.8;
     }
 
@@ -567,7 +622,14 @@
   <div class="page">
     <div class="brand">
       <h1>Clip<em>Nip</em></h1>
-      <p>Free media downloader</p>
+      <p>Free Youtube Downloader</p>
+    </div>
+
+    <div class="settings">
+      <span class="settings-label">Save to</span>
+      <input id="dirInput" type="text" spellcheck="false" placeholder="%USERPROFILE%\Downloads\ClipNip">
+      <button class="settings-btn" onclick="browseDir()">Browse</button>
+      <div class="settings-note" id="dirNote"></div>
     </div>
 
     <textarea id="urls" placeholder="Paste one or more URLs..." rows="2"></textarea>
@@ -597,17 +659,71 @@
     </div>
 
     <div id="cards" class="cards"></div>
-
-    <div class="footer">
-      YouTube &middot; TikTok &middot; Instagram &middot; Twitter/X &middot; Reddit &middot; Facebook<br>
-      Vimeo &middot; Twitch &middot; Dailymotion &middot; SoundCloud &middot; Loom &middot; Streamable<br>
-      Pinterest &middot; Tumblr &middot; Threads &middot; LinkedIn &middot; 1000+ more
-    </div>
   </div>
 
   <script>
     let currentMode = 'video';
     let cardData = [];
+
+    async function loadDir() {
+      try {
+        const res = await fetch('/api/settings', { cache: 'no-store' });
+        const data = await res.json();
+        if (data.download_dir) document.getElementById('dirInput').value = data.download_dir;
+      } catch { /* keep default placeholder */ }
+    }
+
+    async function browseDir() {
+      const note = document.getElementById('dirNote');
+      note.textContent = '';
+      try {
+        const res = await fetch('/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ browse: true }),
+        });
+        const data = await res.json();
+        if (data.download_dir) {
+          document.getElementById('dirInput').value = data.download_dir;
+          note.textContent = 'Folder applied';
+        }
+      } catch (err) {
+        note.textContent = err.message || 'Failed';
+      }
+    }
+
+    async function applyDir() {
+      const note = document.getElementById('dirNote');
+      const dir = document.getElementById('dirInput').value.trim();
+      if (!dir) { note.textContent = 'Enter a folder path'; return; }
+      try {
+        const res = await fetch('/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ download_dir: dir }),
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) {
+          note.textContent = data.error || 'Failed';
+          return;
+        }
+        document.getElementById('dirInput').value = data.download_dir;
+        note.textContent = 'Folder applied';
+      } catch (err) {
+        note.textContent = err.message || 'Failed';
+      }
+    }
+
+    loadDir();
+
+    const dirInput = document.getElementById('dirInput');
+    dirInput.addEventListener('change', applyDir);
+    dirInput.addEventListener('keydown', e => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        applyDir();
+      }
+    });
 
     function setMode(btn) {
       document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));

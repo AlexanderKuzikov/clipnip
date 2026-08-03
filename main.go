@@ -12,6 +12,7 @@ import (
 )
 
 func main() {
+	loadConfig()
 	cleanupStaleParts()
 	startWorkers()
 
