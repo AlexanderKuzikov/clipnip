@@ -1,5 +1,5 @@
 <p align="center">
-  <a href="https://go.dev"><img alt="Go" src="https://img.shields.io/badge/Go-1.22-00ADD8?logo=go&logoColor=white"></a>
+  <a href="https://go.dev"><img alt="Go" src="https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-MIT-blue.svg"></a>
 </p>
 
