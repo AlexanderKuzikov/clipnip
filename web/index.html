@@ -707,15 +707,21 @@
       }
       const done = cardData.filter(c => c.status === 'done' || c.status === 'error' || c.status === 'cancelled').length;
       const active = cardData.filter(c => c.status === 'queued' || c.status === 'downloading' || c.status === 'processing').length;
+      const paused = cardData.filter(c => c.status === 'paused').length;
+      const pct = totalCount ? Math.round(done / totalCount * 100) : 0;
       if (!el) {
         el = document.createElement('div');
         el.id = 'dl-summary';
         el.className = 'dl-summary';
         document.getElementById('cards').prepend(el);
       }
-      const parts = [`Completed ${done} of ${totalCount}`];
+      const parts = [`Completed ${done} of ${totalCount} (${pct}%)`];
       if (active) parts.push(`${active} active`);
-      el.textContent = parts.join(' · ');
+      if (paused) parts.push(`${paused} paused`);
+      el.innerHTML = `
+        <div class="progress-row"><span>${esc(parts.join(' · '))}</span></div>
+        <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
+      `;
     }
 
     async function loadDir() {
@@ -1032,8 +1038,15 @@
       let actionHtml = '';
       if (c.status === 'ready') {
         actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx})">Download</button>${qualityChips}`;
+      } else if (c.status === 'paused') {
+        actionHtml = `
+          <button class="card-dl-btn" onclick="resumeCard(${idx})">Resume</button>
+          <button class="card-dl-btn" onclick="cancelCard(${idx})">Cancel</button>
+          <span class="card-status">Paused</span>
+        `;
       } else if (c.status === 'queued' || c.status === 'downloading' || c.status === 'processing') {
         actionHtml = renderProgress(c);
+        actionHtml += `<button class="card-dl-btn" onclick="pauseCard(${idx})">Pause</button>`;
         if (c.status === 'downloading') {
           actionHtml += `<button class="card-dl-btn" onclick="cancelCard(${idx})">Cancel</button>`;
         }
@@ -1085,7 +1098,12 @@
       const bar = document.createElement('div');
       bar.id = 'dl-all-bar';
       bar.className = 'dl-all-bar';
-      bar.innerHTML = `<button class="dl-all-btn" onclick="dlAll()">Download All</button>`;
+      bar.innerHTML = `
+        <button class="dl-all-btn" onclick="dlAll()">Download All</button>
+        <button class="dl-all-btn" onclick="pauseAllCards()">Pause All</button>
+        <button class="dl-all-btn" onclick="resumeAllCards()">Resume All</button>
+        <button class="dl-all-btn" onclick="cancelAllCards()">Cancel All</button>
+      `;
       document.getElementById('cards').appendChild(bar);
     }
 
@@ -1221,12 +1239,38 @@
       if (!c.jobId) return;
       try {
         await fetch(`/api/cancel/${c.jobId}`, { method: 'POST', cache: 'no-store' });
-      } catch (err) {
-        /* poll will surface the state */
-      }
+      } catch (err) { /* poll will surface the state */ }
       c.status = 'error';
       c.error = 'Cancelling...';
       renderCard(idx);
+    }
+
+    async function pauseCard(idx) {
+      const c = cardData[idx];
+      if (!c.jobId) return;
+      try {
+        await fetch(`/api/pause/${c.jobId}`, { method: 'POST', cache: 'no-store' });
+      } catch (err) { /* poll will surface the state */ }
+    }
+
+    async function resumeCard(idx) {
+      const c = cardData[idx];
+      if (!c.jobId) return;
+      try {
+        await fetch(`/api/resume/${c.jobId}`, { method: 'POST', cache: 'no-store' });
+      } catch (err) { /* poll will surface the state */ }
+    }
+
+    async function pauseAllCards() {
+      try { await fetch('/api/pauseall', { method: 'POST', cache: 'no-store' }); } catch (e) {}
+    }
+
+    async function resumeAllCards() {
+      try { await fetch('/api/resumeall', { method: 'POST', cache: 'no-store' }); } catch (e) {}
+    }
+
+    async function cancelAllCards() {
+      try { await fetch('/api/cancelall', { method: 'POST', cache: 'no-store' }); } catch (e) {}
     }
 
     async function dlAll() {

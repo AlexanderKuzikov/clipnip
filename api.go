@@ -322,6 +322,39 @@ func newAPI() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
 	})
 
+	mux.HandleFunc("/api/pause/", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimPrefix(r.URL.Path, "/api/pause/")
+		if !pauseJob(id) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "Job not found"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "paused"})
+	})
+
+	mux.HandleFunc("/api/resume/", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimPrefix(r.URL.Path, "/api/resume/")
+		if !resumeJob(id) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "Job not found"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "queued"})
+	})
+
+	mux.HandleFunc("/api/pauseall", func(w http.ResponseWriter, r *http.Request) {
+		pauseAllJobs()
+		writeJSON(w, http.StatusOK, map[string]string{"status": "paused"})
+	})
+
+	mux.HandleFunc("/api/resumeall", func(w http.ResponseWriter, r *http.Request) {
+		resumeAllJobs()
+		writeJSON(w, http.StatusOK, map[string]string{"status": "resumed"})
+	})
+
+	mux.HandleFunc("/api/cancelall", func(w http.ResponseWriter, r *http.Request) {
+		cancelAllJobs()
+		writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
+	})
+
 	mux.HandleFunc("/api/open/", func(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimPrefix(r.URL.Path, "/api/open/")
 		job := getJob(id)

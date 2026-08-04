@@ -178,6 +178,9 @@ func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 	close(stopWatch)
 
 	err = cmd.Wait()
+	if job.isPaused() {
+		return errors.New("killed: paused")
+	}
 	if stalled {
 		return errors.New("stalled: no progress")
 	}

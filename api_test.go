@@ -88,10 +88,18 @@ func TestAdaptiveParallel(t *testing.T) {
 	adapt.cooldownUntil = time.Time{}
 	adapt.Unlock()
 
-	// серия сетевых отказов: 3 -> 1 -> пол 1
+	// серия сетевых отказов: 8 -> 4 -> 2 -> 1 -> пол 1
+	adaptFailure("network")
+	if adapt.current != 4 {
+		t.Fatalf("after 1 failure want 4, got %d", adapt.current)
+	}
+	adaptFailure("network")
+	if adapt.current != 2 {
+		t.Fatalf("after 2 failures want 2, got %d", adapt.current)
+	}
 	adaptFailure("network")
 	if adapt.current != 1 {
-		t.Fatalf("after 1 failure want 1, got %d", adapt.current)
+		t.Fatalf("after 3 failures want 1, got %d", adapt.current)
 	}
 	adaptFailure("network")
 	if adapt.current != 1 {

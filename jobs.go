@@ -50,6 +50,12 @@ func (j *Job) isCancelled() bool {
 	return j.Status == "cancelled"
 }
 
+func (j *Job) isPaused() bool {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	return j.Status == "paused"
+}
+
 func (j *Job) snapshot() map[string]any {
 	j.mu.RLock()
 	defer j.mu.RUnlock()
@@ -84,7 +90,7 @@ var jobQueue = make(chan string, 1024)
 // ---- адаптивная параллельность ----
 
 const (
-	startParallel  = 3  // стартовый уровень
+	startParallel  = 8  // стартовый уровень
 	maxParallel    = 10 // жёсткий потолок (YouTube режет при большом числе сессий)
 	minParallel    = 1  // пол
 	successStep    = 15 // +1 за N успешных подряд
@@ -96,11 +102,12 @@ const (
 
 var adapt = struct {
 	sync.Mutex
-	cond         *sync.Cond
-	current      int
-	successes    int
-	active       int
+	cond          *sync.Cond
+	current       int
+	successes     int
+	active        int
 	cooldownUntil time.Time
+	paused        bool
 }{}
 
 func init() {
@@ -108,11 +115,16 @@ func init() {
 	adapt.cond = sync.NewCond(&adapt.Mutex)
 }
 
-// acquire блокирует воркера, пока не освободится пермит или не выйдет cooldown.
+// acquire блокирует воркера, пока не освободится пермит, не выйдет cooldown
+// или не будет снята общая пауза.
 func acquire() {
 	adapt.Lock()
 	defer adapt.Unlock()
 	for {
+		if adapt.paused {
+			adapt.cond.Wait()
+			continue
+		}
 		now := time.Now()
 		if now.Before(adapt.cooldownUntil) && adapt.active == 0 {
 			wait := adapt.cooldownUntil.Sub(now)
@@ -128,6 +140,19 @@ func acquire() {
 		}
 		adapt.cond.Wait()
 	}
+}
+
+func pauseAll() {
+	adapt.Lock()
+	adapt.paused = true
+	adapt.Unlock()
+}
+
+func resumeAll() {
+	adapt.Lock()
+	adapt.paused = false
+	adapt.cond.Broadcast()
+	adapt.Unlock()
 }
 
 func release() {
@@ -172,7 +197,7 @@ func startWorkers() {
 			for id := range jobQueue {
 				acquire()
 				job := getJob(id)
-				if job != nil {
+				if job != nil && !job.isCancelled() && !job.isPaused() {
 					runDownload(job)
 				}
 				release()
@@ -396,28 +421,32 @@ func runDownload(job *Job) {
 		})
 	}
 
-	var lastErr string
-	for {
-		if job.isCancelled() {
-			markCancelled(job)
-			return
-		}
-		args := append(buildDownloadArgs(job), job.URL)
-		err := runYtDlp(job, args, onProgress)
-		if err == nil {
-			lastErr = ""
-			break
-		}
-		lastErr = err.Error()
-		if strings.Contains(lastErr, "cancelled") {
-			markCancelled(job)
-			return
-		}
-		kind := classifyError(lastErr)
-		if kind == "fatal" {
-			break
-		}
-		adaptFailure(kind)
+		var lastErr string
+		for {
+			if job.isCancelled() {
+				markCancelled(job)
+				return
+			}
+			args := append(buildDownloadArgs(job), job.URL)
+			err := runYtDlp(job, args, onProgress)
+			if err == nil {
+				lastErr = ""
+				break
+			}
+			lastErr = err.Error()
+			if strings.Contains(lastErr, "cancelled") {
+				markCancelled(job)
+				return
+			}
+			if strings.Contains(lastErr, "killed: paused") {
+				// юзер поставил на паузу — процесс убит, .part сохранён; тихо выходим
+				return
+			}
+			kind := classifyError(lastErr)
+			if kind == "fatal" {
+				break
+			}
+			adaptFailure(kind)
 
 		job.set(func() { job.Retries++ })
 		job.mu.RLock()
@@ -432,10 +461,16 @@ func runDownload(job *Job) {
 		delay := time.Duration(retries) * retryBaseDelay
 		log.Printf("requeue job=%s kind=%s retry=%d/%d delay=%s", job.JobID, kind, retries, maxRetries, delay.Round(time.Second))
 		job.set(func() {
-			job.Status = "queued"
-			job.Stage = "queued"
-			job.Error = ""
+			// юзер мог поставить на паузу, пока мы разбирались с ошибкой
+			if job.Status != "paused" {
+				job.Status = "queued"
+				job.Stage = "queued"
+				job.Error = ""
+			}
 		})
+		if job.Status == "paused" {
+			return
+		}
 		go func(id string, d time.Duration) {
 			time.Sleep(d)
 			jobQueue <- id
@@ -530,17 +565,20 @@ func parseSpeed(s string) int64 {
 	}
 	s = strings.ToLower(strings.TrimSpace(s))
 	mult := int64(1)
+	var num string
 	switch {
 	case strings.HasSuffix(s, "kib/s"):
 		mult = 1024
+		num = strings.TrimSpace(strings.TrimSuffix(s, "kib/s"))
 	case strings.HasSuffix(s, "mib/s"):
 		mult = 1024 * 1024
+		num = strings.TrimSpace(strings.TrimSuffix(s, "mib/s"))
 	case strings.HasSuffix(s, "gib/s"):
 		mult = 1024 * 1024 * 1024
+		num = strings.TrimSpace(strings.TrimSuffix(s, "gib/s"))
 	default:
 		return 0
 	}
-	num := strings.TrimSpace(strings.TrimSuffix(s, "ib/s"))
 	v, err := strconv.ParseFloat(num, 64)
 	if err != nil {
 		return 0
@@ -643,7 +681,7 @@ func cancelJob(id string) bool {
 		return false
 	}
 	job.set(func() {
-		if job.Status == "queued" || job.Status == "downloading" || job.Status == "processing" {
+		if job.Status == "queued" || job.Status == "downloading" || job.Status == "processing" || job.Status == "paused" {
 			job.Status = "cancelled"
 			job.Stage = "error"
 			job.Error = "cancelled by user"
@@ -653,4 +691,97 @@ func cancelJob(id string) bool {
 	// отменил сам — хвост .part не нужен, убираем мусор
 	cleanupTempFiles(job.DownloadDir, id)
 	return true
+}
+
+func pauseJob(id string) bool {
+	job := getJob(id)
+	if job == nil {
+		return false
+	}
+	job.set(func() {
+		if job.Status == "queued" || job.Status == "downloading" || job.Status == "processing" {
+			job.Status = "paused"
+			job.Stage = "paused"
+		}
+	})
+	killTreeOnCancel(job)
+	return true
+}
+
+func resumeJob(id string) bool {
+	job := getJob(id)
+	if job == nil {
+		return false
+	}
+	job.set(func() {
+		if job.Status == "paused" {
+			job.Status = "queued"
+			job.Stage = "queued"
+			job.Error = ""
+		}
+	})
+	if job.Status == "queued" {
+		select {
+		case jobQueue <- id:
+		default:
+			// очередь полна — попробуем чуть позже
+			go func(i string) {
+				time.Sleep(3 * time.Second)
+				jobQueue <- i
+			}(id)
+		}
+	}
+	return true
+}
+
+func jobStatus(id string) string {
+	job := getJob(id)
+	if job == nil {
+		return ""
+	}
+	job.mu.RLock()
+	defer job.mu.RUnlock()
+	return job.Status
+}
+
+func pauseAllJobs() {
+	pauseAll()
+	jobs.Lock()
+	ids := make([]string, 0, len(jobs.m))
+	for id := range jobs.m {
+		if s := jobStatus(id); s == "downloading" || s == "processing" {
+			ids = append(ids, id)
+		}
+	}
+	jobs.Unlock()
+	for _, id := range ids {
+		pauseJob(id)
+	}
+}
+
+func resumeAllJobs() {
+	resumeAll()
+	jobs.Lock()
+	ids := make([]string, 0, len(jobs.m))
+	for id := range jobs.m {
+		if jobStatus(id) == "paused" {
+			ids = append(ids, id)
+		}
+	}
+	jobs.Unlock()
+	for _, id := range ids {
+		resumeJob(id)
+	}
+}
+
+func cancelAllJobs() {
+	jobs.Lock()
+	ids := make([]string, 0, len(jobs.m))
+	for id := range jobs.m {
+		ids = append(ids, id)
+	}
+	jobs.Unlock()
+	for _, id := range ids {
+		cancelJob(id)
+	}
 }
