@@ -37,11 +37,12 @@ type Job struct {
 	Speed      int64
 	ETA        int64
 
-	Retries     int       // сетевые повторы (requeue)
-	NextRetryAt time.Time // когда retry_wait → queued
-	Running     bool      // защита от двойного запуска
-	Stuck       bool      // watchdog пометил зависшим (байты не растут)
-	LastDataAt  time.Time // последний рост downloaded_bytes
+	Retries       int       // сетевые повторы (requeue)
+	NextRetryAt   time.Time // когда retry_wait → queued
+	FirstRetryAt  time.Time // начало цепочки ретраев (для потолка retryTotalTimeout)
+	Running       bool      // защита от двойного запуска
+	Stuck         bool      // watchdog пометил зависшим (байты не растут)
+	LastDataAt    time.Time // последний рост downloaded_bytes
 
 	pidMu       sync.Mutex
 	pid         int
@@ -135,9 +136,10 @@ const (
 	failDivisor    = 2  // ÷N при сетевом отказе
 	cooldown429    = 30 * time.Second
 	cooldown403    = 15 * time.Second
-	maxRetries     = 3            // повторов после сетевого отказа, дальше — error
-	retryBaseDelay = 5 * time.Second // backoff: 5с, 10с, 15с...
+	maxRetries     = 2            // повторов после сетевого отказа, дальше — error
+	retryBaseDelay = 5 * time.Second // backoff: 5с, 10с...
 	stuckTimeout   = 60 * time.Second // watchdog: нет роста байтов дольше stuckTimeout → джоб «завис»
+	retryTotalTimeout = 90 * time.Second // потолок суммарного времени в retry_wait → error
 )
 
 var adapt = struct {
@@ -449,7 +451,7 @@ func buildDownloadArgs(job *Job) []string {
 	return base
 }
 
-var fatalErrRe = regexp.MustCompile(`(?i)unsupported url|private video|this video is private|not available in your country|unavailable in your country|has been removed|copyright|requested format is not available|http error 404|invalid url|sign in to confirm|age-restricted`)
+var fatalErrRe = regexp.MustCompile(`(?i)unsupported url|private video|this video is private|video unavailable|this video is not available|not available in your country|unavailable in your country|has been removed|copyright|requested format is not available|http error 404|invalid url|sign in to confirm|age-restricted`)
 
 // classifyError: "fatal" — ретраить бессмысленно; "429"/"403" — перегрузка (cooldown);
 // "network" — временный сбой (в т.ч. ложный «Video unavailable» при блокировках).
@@ -583,14 +585,31 @@ func runDownload(job *Job) {
 		log.Printf("requeue job=%s kind=%s retry=%d/%d delay=%s", job.JobID, kind, retries, maxRetries, delay.Round(time.Second))
 		job.set(func() {
 			// юзер мог поставить на паузу, пока мы разбирались с ошибкой
-			if job.Status != "paused" {
-				job.Status = "retry_wait"
-				job.Stage = "retry_wait"
-				job.Error = ""
-				job.NextRetryAt = time.Now().Add(delay)
+			if job.Status == "paused" {
+				return
+			}
+			job.Status = "retry_wait"
+			job.Stage = "retry_wait"
+			job.Error = ""
+			job.NextRetryAt = time.Now().Add(delay)
+			if job.FirstRetryAt.IsZero() {
+				job.FirstRetryAt = time.Now()
 			}
 		})
 		if job.Status == "paused" {
+			return
+		}
+		// потолок суммарного времени в retry — иначе мёртвый джоб забивает retryQueue
+		job.mu.RLock()
+		first := job.FirstRetryAt
+		job.mu.RUnlock()
+		if time.Since(first) > retryTotalTimeout {
+			log.Printf("retry timeout job=%s: spent %s in retry", job.JobID, time.Since(first).Round(time.Second))
+			job.set(func() {
+				job.Status = "error"
+				job.Stage = "error"
+				job.Error = "Retry timeout — слишком долго не удавалось скачать"
+			})
 			return
 		}
 		// джоб вернётся в приоритетную очередь через backoff; слот освобождается сразу
@@ -860,6 +879,8 @@ func resumeJob(id string) bool {
 	job.Status = "queued"
 	job.Stage = "queued"
 	job.Error = ""
+	job.Stuck = false
+	job.FirstRetryAt = time.Time{}
 	job.mu.Unlock()
 
 	select {

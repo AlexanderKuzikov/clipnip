@@ -285,6 +285,8 @@ func newAPI() http.Handler {
 				job.Stage = "queued"
 				job.Error = ""
 				job.Retries = 0
+				job.Stuck = false
+				job.FirstRetryAt = time.Time{}
 				job.DownloadDir = dir
 			})
 		}
