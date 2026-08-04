@@ -24,7 +24,7 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
   - `GET /api/status/<id>`; `POST /api/cancel/<id>`; `GET /api/open/<id>`; `GET /api/file/<id>`
   - `GET/POST /api/settings` — папка загрузки (`download_dir` или `browse`: нативный диалог SHBrowseForFolderW)
 - `config.go` — конфиг в `%LOCALAPPDATA%\clipnip\config.json`; папка загрузки хранится там.
-- `jobs.go` — джобы в памяти, адаптивная параллельность (старт 3, потолок 6, пол 1; +1 за 15 успешных; ÷2 при сетевой ошибке; cooldown 30 с при 429), очередь 1024; сетевой отказ → джоб сам возвращается в очередь (requeue, backoff 10с×N, до 5 повторов) — кнопка Retry только для фатальных; чистка `.part` старше 24 ч; имя файла — title из /api/info (фолбэк: fetchTitle, 15 c), переименование с защитой от коллизий `(1)`.
+- `jobs.go` — джобы в памяти, адаптивная параллельность (старт 3, потолок 10, пол 1; +1 за 15 успешных; ÷2 при сетевой ошибке; cooldown 30 с при 429), очередь 1024; сетевой отказ → джоб сам возвращается в очередь (requeue, backoff 10с×N, до 5 повторов) — кнопка Retry только для фатальных; чистка `.part` старше 24 ч; имя файла — title из /api/info (фолбэк: fetchTitle, 15 c), переименование с защитой от коллизий `(1)`.
 - `ytdlp.go` — subprocess yt-dlp, прогресс-парсер, stall-детект (20 с без прогресса → kill+retry), распаковка из embed, kill-tree. Плейлисты: `--flat-playlist --playlist-items 1-500`, таймаут 90 с.
 - `embedded/*.gz` — gzip-архивы yt-dlp.exe и ffmpeg.exe, вшиты через `//go:embed`. Распаковка в `%LOCALAPPDATA%\clipnip\bin\` при первом запуске (ensureBins). Существующие файлы на диске не перезаписываются.
 

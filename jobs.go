@@ -85,7 +85,7 @@ var jobQueue = make(chan string, 1024)
 
 const (
 	startParallel  = 3  // стартовый уровень
-	maxParallel    = 6  // жёсткий потолок (YouTube режет при большом числе сессий)
+	maxParallel    = 10 // жёсткий потолок (YouTube режет при большом числе сессий)
 	minParallel    = 1  // пол
 	successStep    = 15 // +1 за N успешных подряд
 	failDivisor    = 2  // ÷N при сетевом отказе
