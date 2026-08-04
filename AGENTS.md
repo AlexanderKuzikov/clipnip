@@ -24,8 +24,8 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
   - `GET /api/status/<id>`; `POST /api/cancel/<id>`; `GET /api/open/<id>`; `GET /api/file/<id>`
   - `GET/POST /api/settings` — папка загрузки (`download_dir` или `browse`: нативный диалог SHBrowseForFolderW)
 - `config.go` — конфиг в `%LOCALAPPDATA%\clipnip\config.json`; папка загрузки хранится там.
-- `jobs.go` — джобы в памяти, пул 3 воркера, чистка `.part` старше 24 ч при старте; имя файла — title из /api/info (фолбэк: fetchTitle, 15 c), переименование на диске с защитой от коллизий `(1)`.
-- `ytdlp.go` — subprocess yt-dlp, прогресс-парсер, распаковка из embed, kill-tree.
+- `jobs.go` — джобы в памяти, адаптивная параллельность (старт 5, потолок 20, пол 1; +1 за 10 успешных; ÷2 при сетевой ошибке; cooldown 30 с при 429), очередь 1024, авторетраи 3×5 с (фатальные не ретраятся), чистка `.part` старше 24 ч; имя файла — title из /api/info (фолбэк: fetchTitle, 15 c), переименование на диске с защитой от коллизий `(1)`.
+- `ytdlp.go` — subprocess yt-dlp, прогресс-парсер, stall-детект (20 с без прогресса → kill+retry), распаковка из embed, kill-tree. Плейлисты: `--flat-playlist --playlist-items 1-500`, таймаут 90 с.
 - `embedded/*.gz` — gzip-архивы yt-dlp.exe и ffmpeg.exe, вшиты через `//go:embed`. Распаковка в `%LOCALAPPDATA%\clipnip\bin\` при первом запуске (ensureBins). Существующие файлы на диске не перезаписываются.
 
 ## Обновление вшитых бинарников

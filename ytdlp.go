@@ -93,6 +93,8 @@ func extractEmbedded(dir, gzPath, destName string) error {
 
 var progressTemplate = "download:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s"
 
+const stallTimeout = 20 * time.Second
+
 func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 	dir, err := binDir()
 	if err != nil {
@@ -131,6 +133,31 @@ func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+
+	// stall-детект: нет прогресса дольше stallTimeout — процесс завис, убиваем
+	lastProgress := time.Now()
+	stalled := false
+	stopWatch := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if time.Since(lastProgress) > stallTimeout && !job.isCancelled() {
+					job.pidMu.Lock()
+					pid := job.pid
+					job.pidMu.Unlock()
+					killTree(pid)
+					stalled = true
+					return
+				}
+			case <-stopWatch:
+				return
+			}
+		}
+	}()
+
 	for scanner.Scan() {
 		line := scanner.Text()
 		parts := strings.Split(line, "|")
@@ -142,13 +169,18 @@ func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 			}
 			st.Downloaded = parseNAInt(parts[3])
 			st.Total = parseNAInt(parts[4])
+			lastProgress = time.Now()
 			onProgress(st)
 			continue
 		}
 		errBuf.Write([]byte(line + "\n"))
 	}
+	close(stopWatch)
 
 	err = cmd.Wait()
+	if stalled {
+		return errors.New("stalled: no progress")
+	}
 	if job.isCancelled() {
 		return errors.New("cancelled")
 	}
@@ -197,8 +229,8 @@ func infoJSON(url string, playlist bool) (map[string]any, error) {
 
 	args := []string{"--no-warnings", "--dump-single-json"}
 	if playlist {
-		// плейлист: берём первые 100 записей, таймаут шире
-		args = append(args, "--flat-playlist", "--playlist-items", "1-100")
+		// плейлист: берём первые 500 записей, таймаут шире
+		args = append(args, "--flat-playlist", "--playlist-items", "1-500")
 	} else {
 		args = append(args, "--no-playlist")
 	}

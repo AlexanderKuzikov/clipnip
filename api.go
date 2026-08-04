@@ -288,7 +288,14 @@ func newAPI() http.Handler {
 			})
 		}
 
-		jobQueue <- id
+		select {
+		case jobQueue <- id:
+		default:
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{
+				"error": "Queue is full, try again later",
+			})
+			return
+		}
 
 		writeJSON(w, http.StatusOK, map[string]any{
 			"job_id": id, "status": "queued", "existing": !createdNew, "resumed": hasPartial(dir, id),

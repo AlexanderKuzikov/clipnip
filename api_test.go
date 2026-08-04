@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestFontsServe(t *testing.T) {
@@ -58,4 +59,77 @@ func TestPlaylistEntries(t *testing.T) {
 	if entries[1]["url"] != "https://www.youtube.com/watch?v=bbb222" {
 		t.Errorf("bad url2: %v", entries[1]["url"])
 	}
+}
+
+func TestClassifyError(t *testing.T) {
+	cases := map[string]string{
+		"HTTP Error 429: Too Many Requests":                       "429",
+		"Requested format is not available":                        "fatal",
+		"Video unavailable":                                        "fatal",
+		"Unsupported URL: ftp://x":                                 "fatal",
+		"[generic] timed out":                                      "network",
+		"stalled: no progress":                                     "network",
+		"Read timed out after 15000ms":                             "network",
+		"HTTP Error 503: Service Unavailable":                      "network",
+		"This video is private":                                    "fatal",
+		"Video unavailable in your country":                        "fatal",
+	}
+	for msg, want := range cases {
+		if got := classifyError(msg); got != want {
+			t.Errorf("classifyError(%q) = %q, want %q", msg, got, want)
+		}
+	}
+}
+
+func TestAdaptiveParallel(t *testing.T) {
+	adapt.Lock()
+	adapt.current = startParallel
+	adapt.successes = 0
+	adapt.cooldownUntil = time.Time{}
+	adapt.Unlock()
+
+	// серия сетевых отказов: 5 -> 2 -> 1 -> пол 1
+	adaptFailure("network")
+	if adapt.current != 2 {
+		t.Fatalf("after 1 failure want 2, got %d", adapt.current)
+	}
+	adaptFailure("network")
+	if adapt.current != 1 {
+		t.Fatalf("after 2 failures want 1, got %d", adapt.current)
+	}
+	adaptFailure("network")
+	if adapt.current != 1 {
+		t.Fatalf("floor must be 1, got %d", adapt.current)
+	}
+
+	// 429: ещё и cooldown
+	adaptFailure("429")
+	if adapt.current != 1 {
+		t.Fatalf("429 keeps floor, got %d", adapt.current)
+	}
+	if time.Now().After(adapt.cooldownUntil) {
+		t.Fatal("429 must set cooldownUntil in the future")
+	}
+
+	// рост: 10 успешных подряд -> +1
+	for i := 0; i < successStep; i++ {
+		adaptSuccess()
+	}
+	if adapt.current != 2 {
+		t.Fatalf("after 10 successes want 2, got %d", adapt.current)
+	}
+
+	// потолок
+	for i := 0; i < 200; i++ {
+		adaptSuccess()
+	}
+	if adapt.current != maxParallel {
+		t.Fatalf("ceiling want %d, got %d", maxParallel, adapt.current)
+	}
+
+	adapt.Lock()
+	adapt.current = startParallel
+	adapt.successes = 0
+	adapt.cooldownUntil = time.Time{}
+	adapt.Unlock()
 }

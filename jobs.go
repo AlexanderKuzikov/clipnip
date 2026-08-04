@@ -76,18 +76,101 @@ var jobs = struct {
 	m map[string]*Job
 }{m: make(map[string]*Job)}
 
-var jobQueue = make(chan string, 64)
+var jobQueue = make(chan string, 1024)
 
-const workerCount = 3
+// ---- адаптивная параллельность ----
+
+const (
+	startParallel  = 5  // стартовый уровень
+	maxParallel    = 20 // потолок
+	minParallel    = 1  // пол
+	successStep    = 10 // +1 за N успешных подряд
+	failDivisor    = 2  // ÷N при сетевом отказе
+	cooldown429    = 30 * time.Second
+)
+
+var adapt = struct {
+	sync.Mutex
+	cond         *sync.Cond
+	current      int
+	successes    int
+	active       int
+	cooldownUntil time.Time
+}{}
+
+func init() {
+	adapt.current = startParallel
+	adapt.cond = sync.NewCond(&adapt.Mutex)
+}
+
+// acquire блокирует воркера, пока не освободится пермит или не выйдет cooldown.
+func acquire() {
+	adapt.Lock()
+	defer adapt.Unlock()
+	for {
+		now := time.Now()
+		if now.Before(adapt.cooldownUntil) && adapt.active == 0 {
+			wait := adapt.cooldownUntil.Sub(now)
+			adapt.Unlock()
+			log.Printf("parallel: cooldown %s (429)", wait.Round(time.Second))
+			time.Sleep(wait)
+			adapt.Lock()
+			continue
+		}
+		if adapt.active < adapt.current {
+			adapt.active++
+			return
+		}
+		adapt.cond.Wait()
+	}
+}
+
+func release() {
+	adapt.Lock()
+	adapt.active--
+	adapt.cond.Broadcast()
+	adapt.Unlock()
+}
+
+func adaptSuccess() {
+	adapt.Lock()
+	defer adapt.Unlock()
+	adapt.successes++
+	if adapt.successes >= successStep && adapt.current < maxParallel {
+		adapt.successes = 0
+		adapt.current++
+		log.Printf("parallel: %d -> %d (%d successes in a row)", adapt.current-1, adapt.current, successStep)
+		adapt.cond.Broadcast()
+	}
+}
+
+func adaptFailure(kind string) {
+	adapt.Lock()
+	defer adapt.Unlock()
+	adapt.successes = 0
+	if adapt.current > minParallel {
+		adapt.current /= failDivisor
+		if adapt.current < minParallel {
+			adapt.current = minParallel
+		}
+	}
+	if kind == "429" {
+		adapt.cooldownUntil = time.Now().Add(cooldown429)
+	}
+	log.Printf("parallel: -> %d (failure: %s)", adapt.current, kind)
+	adapt.cond.Broadcast()
+}
 
 func startWorkers() {
-	for i := 0; i < workerCount; i++ {
+	for i := 0; i < maxParallel; i++ {
 		go func() {
 			for id := range jobQueue {
+				acquire()
 				job := getJob(id)
 				if job != nil {
 					runDownload(job)
 				}
+				release()
 			}
 		}()
 	}
@@ -219,7 +302,7 @@ func buildDownloadArgs(job *Job) []string {
 		"--retries", "10",
 		"--fragment-retries", "10",
 		"--extractor-retries", "5",
-		"--socket-timeout", "30",
+		"--socket-timeout", "15",
 	}
 
 	switch job.Mode {
@@ -242,6 +325,24 @@ func buildDownloadArgs(job *Job) []string {
 			"--extract-audio", "--audio-format", "mp3", "--audio-quality", quality)
 	}
 	return base
+}
+
+const maxAttempts = 3
+const retryDelay = 5 * time.Second
+
+var fatalErrRe = regexp.MustCompile(`(?i)unsupported url|video unavailable|private video|this video is private|not available in your country|has been removed|copyright|requested format is not available|http error 40[34]|invalid url|sign in to confirm|age-restricted`)
+
+// classifyError: "fatal" — ретраить бессмысленно; "429" — перегрузка; "network" — временный сбой.
+func classifyError(msg string) string {
+	lower := strings.ToLower(msg)
+	switch {
+	case strings.Contains(lower, "429") || strings.Contains(lower, "too many requests"):
+		return "429"
+	case fatalErrRe.MatchString(lower):
+		return "fatal"
+	default:
+		return "network"
+	}
 }
 
 func runDownload(job *Job) {
@@ -273,9 +374,7 @@ func runDownload(job *Job) {
 		}
 	}
 
-	args := append(buildDownloadArgs(job), job.URL)
-
-	err := runYtDlp(job, args, func(st progressState) {
+	onProgress := func(st progressState) {
 		job.set(func() {
 			if job.Status == "cancelled" {
 				return
@@ -293,20 +392,43 @@ func runDownload(job *Job) {
 				job.Progress = round1(parsePercent(st.Percent))
 			}
 		})
-	})
+	}
 
-	if err != nil {
-		cancelled := strings.Contains(err.Error(), "cancelled")
+	var lastErr string
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if job.isCancelled() {
+			markCancelled(job)
+			return
+		}
+		args := append(buildDownloadArgs(job), job.URL)
+		err := runYtDlp(job, args, onProgress)
+		if err == nil {
+			lastErr = ""
+			break
+		}
+		lastErr = err.Error()
+		if strings.Contains(lastErr, "cancelled") {
+			markCancelled(job)
+			return
+		}
+		kind := classifyError(lastErr)
+		if kind == "fatal" {
+			break
+		}
+		adaptFailure(kind)
+		if attempt < maxAttempts {
+			log.Printf("retry %d/%d job=%s kind=%s: %v", attempt, maxAttempts-1, job.JobID, kind, err)
+			time.Sleep(retryDelay)
+		}
+	}
+
+	if lastErr != "" {
 		job.set(func() {
-			if cancelled {
-				job.Status = "cancelled"
-			} else {
-				job.Status = "error"
-			}
+			job.Status = "error"
 			job.Stage = "error"
-			job.Error = err.Error()
+			job.Error = lastErr
 		})
-		log.Printf("download failed job=%s url=%s: %v", job.JobID, job.URL, err)
+		log.Printf("download failed job=%s url=%s: %s", job.JobID, job.URL, lastErr)
 		return
 	}
 
@@ -344,6 +466,15 @@ func runDownload(job *Job) {
 		job.Filename = filename
 		job.Speed = 0
 		job.ETA = 0
+	})
+	adaptSuccess()
+}
+
+func markCancelled(job *Job) {
+	job.set(func() {
+		job.Status = "cancelled"
+		job.Stage = "error"
+		job.Error = "cancelled by user"
 	})
 }
 

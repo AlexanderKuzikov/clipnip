@@ -282,6 +282,15 @@
       border-bottom: 1px solid var(--card-border);
     }
 
+    .dl-summary {
+      font-size: 0.7rem;
+      color: var(--muted);
+      letter-spacing: 0.03em;
+      margin-bottom: 10px;
+      padding: 8px 4px;
+      border-bottom: 1px solid var(--card-border);
+    }
+
     .card {
       display: flex;
       gap: 14px;
@@ -688,6 +697,26 @@
   <script>
     let currentMode = 'video';
     let cardData = [];
+    let totalCount = 0;
+
+    function updateSummary() {
+      let el = document.getElementById('dl-summary');
+      if (totalCount === 0) {
+        if (el) el.remove();
+        return;
+      }
+      const done = cardData.filter(c => c.status === 'done' || c.status === 'error' || c.status === 'cancelled').length;
+      const active = cardData.filter(c => c.status === 'queued' || c.status === 'downloading' || c.status === 'processing').length;
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'dl-summary';
+        el.className = 'dl-summary';
+        document.getElementById('cards').prepend(el);
+      }
+      const parts = [`Completed ${done} of ${totalCount}`];
+      if (active) parts.push(`${active} active`);
+      el.textContent = parts.join(' · ');
+    }
 
     async function loadDir() {
       try {
@@ -926,6 +955,9 @@
         renderDownloadAll();
       }
 
+      totalCount = cardData.length;
+      updateSummary();
+
       btn.disabled = false;
       btn.textContent = 'Fetch';
     }
@@ -1029,6 +1061,8 @@
           ${note}
         </div>
       `;
+
+      updateSummary();
     }
 
     function renderPlaylistHeader(title, count) {
