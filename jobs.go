@@ -127,8 +127,8 @@ const (
 	failDivisor    = 2  // ÷N при сетевом отказе
 	cooldown429    = 30 * time.Second
 	cooldown403    = 15 * time.Second
-	maxRetries     = 5            // повторов после сетевого отказа, дальше — error
-	retryBaseDelay = 10 * time.Second // backoff: 10с, 20с, 30с...
+	maxRetries     = 3            // повторов после сетевого отказа, дальше — error
+	retryBaseDelay = 5 * time.Second // backoff: 5с, 10с, 15с...
 )
 
 var adapt = struct {
@@ -469,37 +469,45 @@ func runDownload(job *Job) {
 		})
 	}
 
-		var lastErr string
-		for {
-			if job.isCancelled() {
-				markCancelled(job)
-				return
-			}
-			args := append(buildDownloadArgs(job), job.URL)
-			err := runYtDlp(job, args, onProgress)
-			if err == nil {
-				lastErr = ""
-				break
-			}
-			lastErr = err.Error()
-			if strings.Contains(lastErr, "cancelled") {
-				markCancelled(job)
-				return
-			}
-			if strings.Contains(lastErr, "killed: paused") {
-				// юзер поставил на паузу — процесс убит, .part сохранён; статус мог быть
-				// перетёрт последним тиком прогресса — возвращаем paused
-				job.set(func() {
-					job.Status = "paused"
-					job.Stage = "paused"
-				})
-				return
-			}
-			kind := classifyError(lastErr)
-			if kind == "fatal" {
-				break
-			}
-			adaptFailure(kind)
+	var lastErr string
+	formatFallback := false
+	for {
+		if job.isCancelled() {
+			markCancelled(job)
+			return
+		}
+		args := append(buildDownloadArgs(job), job.URL)
+		err := runYtDlp(job, args, onProgress)
+		if err == nil {
+			lastErr = ""
+			break
+		}
+		lastErr = err.Error()
+		if strings.Contains(lastErr, "cancelled") {
+			markCancelled(job)
+			return
+		}
+		if strings.Contains(lastErr, "killed: paused") {
+			// юзер поставил на паузу — процесс убит, .part сохранён; статус мог быть
+			// перетёрт последним тиком прогресса — возвращаем paused
+			job.set(func() {
+				job.Status = "paused"
+				job.Stage = "paused"
+			})
+			return
+		}
+		// видео воспроизводится, но выбранное качество недоступно — пробуем дефолтный формат
+		if strings.Contains(strings.ToLower(lastErr), "requested format is not available") && job.FormatID != "" && !formatFallback {
+			formatFallback = true
+			job.set(func() { job.FormatID = "" })
+			log.Printf("format fallback job=%s: retry with default format", job.JobID)
+			continue
+		}
+		kind := classifyError(lastErr)
+		if kind == "fatal" {
+			break
+		}
+		adaptFailure(kind)
 
 		job.set(func() { job.Retries++ })
 		job.mu.RLock()

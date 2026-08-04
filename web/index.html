@@ -1107,7 +1107,13 @@
         <button class="dl-all-btn" onclick="resumeAllCards()">Resume All</button>
         <button class="dl-all-btn" onclick="cancelAllCards()">Cancel All</button>
       `;
-      document.getElementById('cards').appendChild(bar);
+      const cards = document.getElementById('cards');
+      const firstCard = cards.querySelector('.card');
+      if (firstCard) {
+        cards.insertBefore(bar, firstCard);
+      } else {
+        cards.appendChild(bar);
+      }
     }
 
     function pickFormat(idx, formatId) {
