@@ -205,6 +205,7 @@ func newAPI() http.Handler {
 			Mode     string `json:"mode"`
 			FormatID string `json:"format_id"`
 			Title    string `json:"title"`
+			Force    bool   `json:"force"`
 		}
 		json.NewDecoder(r.Body).Decode(&req)
 		u := strings.TrimSpace(req.URL)
@@ -289,6 +290,7 @@ func newAPI() http.Handler {
 				job.Stuck = false
 				job.FirstRetryAt = time.Time{}
 				job.DownloadDir = dir
+				job.Force = req.Force
 			})
 		}
 

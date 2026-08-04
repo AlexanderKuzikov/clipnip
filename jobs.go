@@ -43,6 +43,7 @@ type Job struct {
 	Running       bool      // защита от двойного запуска
 	Stuck         bool      // watchdog пометил зависшим (байты не растут)
 	LastDataAt    time.Time // последний рост downloaded_bytes
+	Force         bool      // одноразовый обход пропуска «уже скачано» (Download anyway)
 
 	pidMu       sync.Mutex
 	pid         int
@@ -65,6 +66,12 @@ func (j *Job) isStuck() bool {
 	j.mu.RLock()
 	defer j.mu.RUnlock()
 	return j.Stuck
+}
+
+func (j *Job) isForced() bool {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	return j.Force
 }
 
 // claim захватывает джоб для запуска воркером (один запуск, даже если
@@ -385,16 +392,7 @@ func findFinalFile(dir, id, mode string) string {
 		return ""
 	}
 
-	var preferred []string
-	switch mode {
-	case "video":
-		preferred = []string{".mp4", ".mkv", ".webm"}
-	case "m4a":
-		preferred = []string{".m4a", ".webm", ".opus"}
-	default:
-		preferred = []string{".mp3", ".m4a", ".webm", ".opus"}
-	}
-
+	preferred := preferredExts(mode)
 	sortByModTimeDesc(files)
 	for _, ext := range preferred {
 		for _, f := range files {
@@ -412,6 +410,33 @@ func sortByModTimeDesc(paths []string) {
 		fj, _ := os.Stat(paths[j])
 		return fi.ModTime().After(fj.ModTime())
 	})
+}
+
+func preferredExts(mode string) []string {
+	switch mode {
+	case "video":
+		return []string{".mp4", ".mkv", ".webm"}
+	case "m4a":
+		return []string{".m4a", ".webm", ".opus"}
+	default:
+		return []string{".mp3", ".m4a", ".webm", ".opus"}
+	}
+}
+
+// findExistingFile ищет уже скачанный файл в папке загрузки: то же имя, что
+// дало бы renameTo (sanitizeFilename от title), + одно из расширений режима.
+func findExistingFile(dir, title, fallback, mode string) string {
+	if strings.TrimSpace(title) == "" {
+		return ""
+	}
+	base := sanitizeFilename(title, fallback)
+	for _, ext := range preferredExts(mode) {
+		p := filepath.Join(dir, base+ext)
+		if fileExists(p) {
+			return p
+		}
+	}
+	return ""
 }
 
 var (
@@ -500,6 +525,31 @@ func runDownload(job *Job) {
 			job.set(func() { job.Title = title })
 		}
 	}
+
+	// файл уже лежит в папке загрузки — не качаем повторно
+	if !job.isForced() {
+		job.mu.RLock()
+		title := job.Title
+		job.mu.RUnlock()
+		if existing := findExistingFile(dir, title, job.JobID, job.Mode); existing != "" {
+			marked := false
+			job.set(func() {
+				if job.Status == "paused" || job.Status == "cancelled" {
+					return
+				}
+				job.Status = "skipped"
+				job.Stage = "skipped"
+				job.File = existing
+				job.Filename = filepath.Base(existing)
+				marked = true
+			})
+			if marked {
+				log.Printf("skipped job=%s: file already exists: %s", job.JobID, existing)
+				return
+			}
+		}
+	}
+	job.set(func() { job.Force = false })
 
 	onProgress := func(st progressState) {
 		job.set(func() {

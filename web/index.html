@@ -715,10 +715,11 @@
         if (el) el.remove();
         return;
       }
-      const done = cardData.filter(c => c.status === 'done' || c.status === 'error' || c.status === 'cancelled').length;
+      const done = cardData.filter(c => c.status === 'done' || c.status === 'error' || c.status === 'cancelled' || c.status === 'skipped').length;
       const active = cardData.filter(c => c.status === 'queued' || c.status === 'downloading' || c.status === 'processing').length;
       const paused = cardData.filter(c => c.status === 'paused').length;
       const retrying = cardData.filter(c => c.stage === 'retry_wait').length;
+      const skipped = cardData.filter(c => c.status === 'skipped').length;
       const pct = totalCount ? Math.round(done / totalCount * 100) : 0;
       if (!el) {
         el = document.createElement('div');
@@ -730,6 +731,7 @@
       if (active) parts.push(`${active} active`);
       if (retrying) parts.push(`${retrying} retrying`);
       if (paused) parts.push(`${paused} paused`);
+      if (skipped) parts.push(`${skipped} skipped`);
       el.innerHTML = `
         <div class="progress-row"><span>${esc(parts.join(' · '))}</span></div>
         <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
@@ -1074,6 +1076,12 @@
           <button class="card-dl-btn done" onclick="openFolder(${idx})">Open folder</button>
           <span class="card-status done">${esc(c.filename || '')}</span>
         `;
+      } else if (c.status === 'skipped') {
+        actionHtml = `
+          <button class="card-dl-btn" onclick="dlCard(${idx}, true)">Download anyway</button>
+          <button class="card-dl-btn done" onclick="openFolder(${idx})">Open folder</button>
+          <span class="card-status done">Already downloaded · ${esc(c.filename || '')}</span>
+        `;
       } else if (c.status === 'error') {
         actionHtml = `
           <button class="card-dl-btn" onclick="dlCard(${idx})">Retry</button>
@@ -1138,7 +1146,7 @@
       renderCard(idx);
     }
 
-    async function dlCard(idx) {
+    async function dlCard(idx, force) {
       const c = cardData[idx];
       c.requestMode = currentMode;
       c.status = 'queued';
@@ -1159,6 +1167,7 @@
             mode: c.requestMode,
             format_id: c.requestMode === 'video' ? c.selectedFormatId : null,
             title: c.title || '',
+            force: !!force,
           }),
         });
 
@@ -1224,7 +1233,7 @@
 
         renderCard(idx);
 
-        if (data.status === 'done') {
+        if (data.status === 'done' || data.status === 'skipped') {
           renderCard(idx);
           return;
         }

@@ -4,6 +4,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -176,4 +178,40 @@ func TestAdaptiveParallel(t *testing.T) {
 	adapt.successes = 0
 	adapt.cooldownUntil = time.Time{}
 	adapt.Unlock()
+}
+
+func TestFindExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("Song One.mp3")
+	write("Clip Two.mp4")
+	write("Bad Name.mp3")
+
+	if got := findExistingFile(dir, "Song One", "fb", "mp3_128"); filepath.Base(got) != "Song One.mp3" {
+		t.Errorf("mp3 mode: want Song One.mp3, got %q", got)
+	}
+	if got := findExistingFile(dir, "Song One", "fb", "video"); got != "" {
+		t.Errorf("video mode: .mp3 must not match, got %q", got)
+	}
+	if got := findExistingFile(dir, "Clip Two", "fb", "video"); filepath.Base(got) != "Clip Two.mp4" {
+		t.Errorf("video mode: want Clip Two.mp4, got %q", got)
+	}
+	if got := findExistingFile(dir, "Clip Two", "fb", "m4a"); got != "" {
+		t.Errorf("m4a mode: .mp4 must not match, got %q", got)
+	}
+	if got := findExistingFile(dir, "Missing", "fb", "video"); got != "" {
+		t.Errorf("want miss for Missing, got %q", got)
+	}
+	if got := findExistingFile(dir, "", "fb", "video"); got != "" {
+		t.Errorf("empty title must not match, got %q", got)
+	}
+	// небезопасные символы вычищаются так же, как в renameTo
+	if got := findExistingFile(dir, "Bad: Name", "fb", "mp3_192"); filepath.Base(got) != "Bad Name.mp3" {
+		t.Errorf("sanitized title must match, got %q", got)
+	}
 }
