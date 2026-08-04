@@ -88,14 +88,10 @@ func TestAdaptiveParallel(t *testing.T) {
 	adapt.cooldownUntil = time.Time{}
 	adapt.Unlock()
 
-	// серия сетевых отказов: 5 -> 2 -> 1 -> пол 1
-	adaptFailure("network")
-	if adapt.current != 2 {
-		t.Fatalf("after 1 failure want 2, got %d", adapt.current)
-	}
+	// серия сетевых отказов: 3 -> 1 -> пол 1
 	adaptFailure("network")
 	if adapt.current != 1 {
-		t.Fatalf("after 2 failures want 1, got %d", adapt.current)
+		t.Fatalf("after 1 failure want 1, got %d", adapt.current)
 	}
 	adaptFailure("network")
 	if adapt.current != 1 {
@@ -111,12 +107,12 @@ func TestAdaptiveParallel(t *testing.T) {
 		t.Fatal("429 must set cooldownUntil in the future")
 	}
 
-	// рост: 10 успешных подряд -> +1
+	// рост: successStep успешных подряд -> +1
 	for i := 0; i < successStep; i++ {
 		adaptSuccess()
 	}
 	if adapt.current != 2 {
-		t.Fatalf("after 10 successes want 2, got %d", adapt.current)
+		t.Fatalf("after %d successes want 2, got %d", successStep, adapt.current)
 	}
 
 	// потолок

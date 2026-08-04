@@ -37,6 +37,8 @@ type Job struct {
 	Speed      int64
 	ETA        int64
 
+	Retries int // сетевые повторы (requeue)
+
 	pidMu       sync.Mutex
 	pid         int
 	DownloadDir string
@@ -62,6 +64,7 @@ func (j *Job) snapshot() map[string]any {
 		"total_human":      humanBytes(j.Total),
 		"speed_human":      humanBytes(j.Speed),
 		"eta_human":        humanETA(j.ETA),
+		"retries":          j.Retries,
 	}
 }
 
@@ -81,12 +84,14 @@ var jobQueue = make(chan string, 1024)
 // ---- адаптивная параллельность ----
 
 const (
-	startParallel  = 5  // стартовый уровень
-	maxParallel    = 20 // потолок
+	startParallel  = 3  // стартовый уровень
+	maxParallel    = 6  // жёсткий потолок (YouTube режет при большом числе сессий)
 	minParallel    = 1  // пол
-	successStep    = 10 // +1 за N успешных подряд
+	successStep    = 15 // +1 за N успешных подряд
 	failDivisor    = 2  // ÷N при сетевом отказе
 	cooldown429    = 30 * time.Second
+	maxRetries     = 5            // повторов после сетевого отказа, дальше — error
+	retryBaseDelay = 10 * time.Second // backoff: 10с, 20с, 30с...
 )
 
 var adapt = struct {
@@ -327,9 +332,6 @@ func buildDownloadArgs(job *Job) []string {
 	return base
 }
 
-const maxAttempts = 3
-const retryDelay = 5 * time.Second
-
 var fatalErrRe = regexp.MustCompile(`(?i)unsupported url|video unavailable|private video|this video is private|not available in your country|has been removed|copyright|requested format is not available|http error 40[34]|invalid url|sign in to confirm|age-restricted`)
 
 // classifyError: "fatal" — ретраить бессмысленно; "429" — перегрузка; "network" — временный сбой.
@@ -395,7 +397,7 @@ func runDownload(job *Job) {
 	}
 
 	var lastErr string
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
+	for {
 		if job.isCancelled() {
 			markCancelled(job)
 			return
@@ -416,10 +418,29 @@ func runDownload(job *Job) {
 			break
 		}
 		adaptFailure(kind)
-		if attempt < maxAttempts {
-			log.Printf("retry %d/%d job=%s kind=%s: %v", attempt, maxAttempts-1, job.JobID, kind, err)
-			time.Sleep(retryDelay)
+
+		job.set(func() { job.Retries++ })
+		job.mu.RLock()
+		retries := job.Retries
+		job.mu.RUnlock()
+
+		if retries > maxRetries {
+			log.Printf("download failed job=%s url=%s after %d retries: %s", job.JobID, job.URL, maxRetries, lastErr)
+			break
 		}
+
+		delay := time.Duration(retries) * retryBaseDelay
+		log.Printf("requeue job=%s kind=%s retry=%d/%d delay=%s", job.JobID, kind, retries, maxRetries, delay.Round(time.Second))
+		job.set(func() {
+			job.Status = "queued"
+			job.Stage = "queued"
+			job.Error = ""
+		})
+		go func(id string, d time.Duration) {
+			time.Sleep(d)
+			jobQueue <- id
+		}(job.JobID, delay)
+		return // слот освобождается; джоб сам вернётся в очередь
 	}
 
 	if lastErr != "" {

@@ -853,6 +853,8 @@
 
       let left;
       if (c.stage === 'processing') left = 'Processing...';
+      else if (c.stage === 'queued' && c.retries) left = `Waiting in queue (retry ${c.retries})...`;
+      else if (c.stage === 'queued') left = 'Waiting in queue...';
       else if (idle) left = 'Connecting to server...';
       else left = `Downloading ${percent}`;
       if (c.resumed) left += ' · resumed';
@@ -1129,6 +1131,7 @@
       c.resumed = !!data.resumed;
       c.startedAt = Date.now();
       c.elapsed = null;
+      c.retries = 0;
 
         if (data.status === 'done') {
           c.status = 'done';
@@ -1169,6 +1172,7 @@
         c.totalHuman = data.total_human || null;
         c.speedHuman = data.speed_human || null;
         c.etaHuman = data.eta_human || null;
+        c.retries = data.retries || 0;
         if (c.startedAt && (data.status === 'downloading' || data.status === 'processing')) {
           c.elapsed = fmtElapsed((Date.now() - c.startedAt) / 1000);
         }
