@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -91,6 +92,8 @@ func extractEmbedded(dir, gzPath, destName string) error {
 	return os.Rename(tmp, dest)
 }
 
+var errStripRe = regexp.MustCompile(`(?m)^ERROR:\s*`)
+
 var progressTemplate = "download:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s"
 
 const stallTimeout = 20 * time.Second
@@ -135,8 +138,9 @@ func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
 	// stall-детект: нет прогресса дольше stallTimeout — процесс завис, убиваем
-	lastProgress := time.Now()
-	stalled := false
+	lastProgress := atomic.Int64{}
+	lastProgress.Store(time.Now().UnixNano())
+	stalled := atomic.Bool{}
 	stopWatch := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
@@ -144,12 +148,13 @@ func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 		for {
 			select {
 			case <-ticker.C:
-				if time.Since(lastProgress) > stallTimeout && !job.isCancelled() {
+				last := time.Unix(0, lastProgress.Load())
+				if time.Since(last) > stallTimeout && !job.isCancelled() {
 					job.pidMu.Lock()
 					pid := job.pid
 					job.pidMu.Unlock()
 					killTree(pid)
-					stalled = true
+					stalled.Store(true)
 					return
 				}
 			case <-stopWatch:
@@ -169,7 +174,7 @@ func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 			}
 			st.Downloaded = parseNAInt(parts[3])
 			st.Total = parseNAInt(parts[4])
-			lastProgress = time.Now()
+			lastProgress.Store(time.Now().UnixNano())
 			onProgress(st)
 			continue
 		}
@@ -181,7 +186,7 @@ func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 	if job.isPaused() {
 		return errors.New("killed: paused")
 	}
-	if stalled {
+	if stalled.Load() {
 		return errors.New("stalled: no progress")
 	}
 	if job.isCancelled() {
@@ -190,7 +195,7 @@ func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 	if err != nil {
 		msg := strings.TrimSpace(errBuf.String())
 		if msg != "" {
-			msg = regexp.MustCompile(`(?m)^ERROR:\s*`).ReplaceAllString(msg, "")
+			msg = errStripRe.ReplaceAllString(msg, "")
 			return errors.New(strings.TrimSpace(msg))
 		}
 	}
@@ -199,9 +204,12 @@ func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 
 type limitedBuffer struct{ buf []byte }
 
+// Write держит ХВОСТ вывода: реальные ошибки yt-dlp приходят в конце,
+// а первые 4КБ обычно съедает stdout-шум.
 func (b *limitedBuffer) Write(p []byte) (int, error) {
-	if len(b.buf) < 4096 {
-		b.buf = append(b.buf, p...)
+	b.buf = append(b.buf, p...)
+	if len(b.buf) > 8192 {
+		b.buf = b.buf[len(b.buf)-4096:]
 	}
 	return len(p), nil
 }
@@ -264,7 +272,7 @@ func infoJSON(url string, playlist bool) (map[string]any, error) {
 		if err != nil {
 			msg := strings.TrimSpace(errBuf.String())
 			if msg != "" {
-				msg = regexp.MustCompile(`(?m)^ERROR:\s*`).ReplaceAllString(msg, "")
+				msg = errStripRe.ReplaceAllString(msg, "")
 				return nil, errors.New(strings.TrimSpace(msg))
 			}
 			return nil, err

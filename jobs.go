@@ -168,10 +168,12 @@ func acquire() {
 			continue
 		}
 		now := time.Now()
-		if now.Before(adapt.cooldownUntil) && adapt.active == 0 {
+		// cooldown после 429/403: блокируем ВСЕ новые старты до конца паузы,
+		// иначе активные загрузки маскируют cooldown и шторм усугубляется
+		if now.Before(adapt.cooldownUntil) {
 			wait := adapt.cooldownUntil.Sub(now)
 			adapt.Unlock()
-			log.Printf("parallel: cooldown %s (429)", wait.Round(time.Second))
+			log.Printf("parallel: cooldown %s", wait.Round(time.Second))
 			time.Sleep(wait)
 			adapt.Lock()
 			continue
@@ -413,8 +415,9 @@ func sortByModTimeDesc(paths []string) {
 }
 
 var (
-	formatIDRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
-	audioModeRe = regexp.MustCompile(`^(m4a|mp3_128|mp3_192)$`)
+	formatIDRe   = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+	audioModeRe  = regexp.MustCompile(`^(m4a|mp3_128|mp3_192)$`)
+	unsafeNameRe = regexp.MustCompile(`[\\/:*?"<>|\x00-\x1F]`)
 )
 
 func buildDownloadArgs(job *Job) []string {
@@ -807,7 +810,7 @@ func sanitizeFilename(name, fallback string) string {
 	if name == "" {
 		return fallback
 	}
-	name = regexp.MustCompile(`[\\/:*?"<>|\x00-\x1F]`).ReplaceAllString(name, "")
+	name = unsafeNameRe.ReplaceAllString(name, "")
 	name = strings.Join(strings.Fields(name), " ")
 	name = strings.TrimRight(strings.TrimSpace(name), ". ")
 	if name == "" {
