@@ -708,6 +708,7 @@
       const done = cardData.filter(c => c.status === 'done' || c.status === 'error' || c.status === 'cancelled').length;
       const active = cardData.filter(c => c.status === 'queued' || c.status === 'downloading' || c.status === 'processing').length;
       const paused = cardData.filter(c => c.status === 'paused').length;
+      const retrying = cardData.filter(c => c.stage === 'retry_wait').length;
       const pct = totalCount ? Math.round(done / totalCount * 100) : 0;
       if (!el) {
         el = document.createElement('div');
@@ -717,6 +718,7 @@
       }
       const parts = [`Completed ${done} of ${totalCount} (${pct}%)`];
       if (active) parts.push(`${active} active`);
+      if (retrying) parts.push(`${retrying} retrying`);
       if (paused) parts.push(`${paused} paused`);
       el.innerHTML = `
         <div class="progress-row"><span>${esc(parts.join(' · '))}</span></div>
@@ -859,6 +861,7 @@
 
       let left;
       if (c.stage === 'processing') left = 'Processing...';
+      else if (c.stage === 'retry_wait') left = `Retrying in ${c.retryIn}s (attempt ${c.retries})...`;
       else if (c.stage === 'queued' && c.retries) left = `Waiting in queue (retry ${c.retries})...`;
       else if (c.stage === 'queued') left = 'Waiting in queue...';
       else if (idle) left = 'Connecting to server...';
@@ -1044,10 +1047,10 @@
           <button class="card-dl-btn" onclick="cancelCard(${idx})">Cancel</button>
           <span class="card-status">Paused</span>
         `;
-      } else if (c.status === 'queued' || c.status === 'downloading' || c.status === 'processing') {
+      } else if (c.status === 'queued' || c.status === 'downloading' || c.status === 'processing' || c.status === 'retry_wait') {
         actionHtml = renderProgress(c);
         actionHtml += `<button class="card-dl-btn" onclick="pauseCard(${idx})">Pause</button>`;
-        if (c.status === 'downloading') {
+        if (c.status === 'downloading' || c.status === 'retry_wait') {
           actionHtml += `<button class="card-dl-btn" onclick="cancelCard(${idx})">Cancel</button>`;
         }
       } else if (c.status === 'done') {
@@ -1191,6 +1194,7 @@
         c.speedHuman = data.speed_human || null;
         c.etaHuman = data.eta_human || null;
         c.retries = data.retries || 0;
+        c.retryIn = data.retry_in || 0;
         if (c.startedAt && (data.status === 'downloading' || data.status === 'processing')) {
           c.elapsed = fmtElapsed((Date.now() - c.startedAt) / 1000);
         }

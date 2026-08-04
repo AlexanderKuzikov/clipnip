@@ -64,19 +64,59 @@ func TestPlaylistEntries(t *testing.T) {
 func TestClassifyError(t *testing.T) {
 	cases := map[string]string{
 		"HTTP Error 429: Too Many Requests":                       "429",
+		"HTTP Error 403: Forbidden":                               "403",
 		"Requested format is not available":                        "fatal",
-		"Video unavailable":                                        "fatal",
+		"Video unavailable":                                        "network",
+		"This video is not available":                              "network",
+		"This video is private":                                    "fatal",
+		"Private video":                                            "fatal",
 		"Unsupported URL: ftp://x":                                 "fatal",
 		"[generic] timed out":                                      "network",
 		"stalled: no progress":                                     "network",
 		"Read timed out after 15000ms":                             "network",
 		"HTTP Error 503: Service Unavailable":                      "network",
-		"This video is private":                                    "fatal",
 		"Video unavailable in your country":                        "fatal",
+		"HTTP Error 404: Not Found":                                "fatal",
 	}
 	for msg, want := range cases {
 		if got := classifyError(msg); got != want {
 			t.Errorf("classifyError(%q) = %q, want %q", msg, got, want)
+		}
+	}
+}
+
+func TestPauseResumeAllNoDeadlock(t *testing.T) {
+	dir := t.TempDir()
+	jobs.Lock()
+	jobs.m["aaa"] = &Job{JobID: "aaa", Status: "downloading", Stage: "downloading", DownloadDir: dir}
+	jobs.m["bbb"] = &Job{JobID: "bbb", Status: "queued", Stage: "queued", DownloadDir: dir}
+	jobs.m["ccc"] = &Job{JobID: "ccc", Status: "retry_wait", Stage: "retry_wait", DownloadDir: dir}
+	jobs.m["ddd"] = &Job{JobID: "ddd", Status: "done", Stage: "done", DownloadDir: dir}
+	jobs.Unlock()
+	t.Cleanup(func() {
+		jobs.Lock()
+		delete(jobs.m, "aaa")
+		delete(jobs.m, "bbb")
+		delete(jobs.m, "ccc")
+		delete(jobs.m, "ddd")
+		jobs.Unlock()
+		resumeAll()
+	})
+
+	pauseAllJobs()
+	for _, id := range []string{"aaa", "bbb", "ccc"} {
+		if s := jobStatus(id); s != "paused" {
+			t.Fatalf("pauseAllJobs: %s want paused, got %s", id, s)
+		}
+	}
+	if s := jobStatus("ddd"); s != "done" {
+		t.Fatalf("pauseAllJobs must not touch done, got %s", s)
+	}
+
+	resumeAllJobs()
+	for _, id := range []string{"aaa", "bbb", "ccc"} {
+		if s := jobStatus(id); s != "queued" {
+			t.Fatalf("resumeAllJobs: %s want queued, got %s", id, s)
 		}
 	}
 }

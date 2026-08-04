@@ -37,7 +37,9 @@ type Job struct {
 	Speed      int64
 	ETA        int64
 
-	Retries int // сетевые повторы (requeue)
+	Retries     int       // сетевые повторы (requeue)
+	NextRetryAt time.Time // когда retry_wait → queued
+	Running     bool      // защита от двойного запуска
 
 	pidMu       sync.Mutex
 	pid         int
@@ -56,9 +58,35 @@ func (j *Job) isPaused() bool {
 	return j.Status == "paused"
 }
 
+// claim захватывает джоб для запуска воркером (один запуск, даже если
+// джоб попал в очередь дважды — resume/requeue поверх pause).
+func (j *Job) claim() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.Running || j.Status != "queued" {
+		return false
+	}
+	j.Running = true
+	return true
+}
+
+func (j *Job) unclaim() {
+	j.mu.Lock()
+	j.Running = false
+	j.mu.Unlock()
+}
+
 func (j *Job) snapshot() map[string]any {
 	j.mu.RLock()
 	defer j.mu.RUnlock()
+	retryIn := 0
+	if j.Status == "retry_wait" && !j.NextRetryAt.IsZero() {
+		sec := int(time.Until(j.NextRetryAt).Seconds())
+		if sec < 0 {
+			sec = 0
+		}
+		retryIn = sec
+	}
 	return map[string]any{
 		"status":           j.Status,
 		"stage":            j.Stage,
@@ -71,6 +99,7 @@ func (j *Job) snapshot() map[string]any {
 		"speed_human":      humanBytes(j.Speed),
 		"eta_human":        humanETA(j.ETA),
 		"retries":          j.Retries,
+		"retry_in":         retryIn,
 	}
 }
 
@@ -86,6 +115,7 @@ var jobs = struct {
 }{m: make(map[string]*Job)}
 
 var jobQueue = make(chan string, 1024)
+var retryQueue = make(chan string, 256)
 
 // ---- адаптивная параллельность ----
 
@@ -96,6 +126,7 @@ const (
 	successStep    = 15 // +1 за N успешных подряд
 	failDivisor    = 2  // ÷N при сетевом отказе
 	cooldown429    = 30 * time.Second
+	cooldown403    = 15 * time.Second
 	maxRetries     = 5            // повторов после сетевого отказа, дальше — error
 	retryBaseDelay = 10 * time.Second // backoff: 10с, 20с, 30с...
 )
@@ -184,8 +215,11 @@ func adaptFailure(kind string) {
 			adapt.current = minParallel
 		}
 	}
-	if kind == "429" {
+	switch kind {
+	case "429":
 		adapt.cooldownUntil = time.Now().Add(cooldown429)
+	case "403":
+		adapt.cooldownUntil = time.Now().Add(cooldown403)
 	}
 	log.Printf("parallel: -> %d (failure: %s)", adapt.current, kind)
 	adapt.cond.Broadcast()
@@ -194,11 +228,22 @@ func adaptFailure(kind string) {
 func startWorkers() {
 	for i := 0; i < maxParallel; i++ {
 		go func() {
-			for id := range jobQueue {
+			for {
+				var id string
+				// приоритет: упавшие/резюмированные раньше новых
+				select {
+				case id = <-retryQueue:
+				default:
+					select {
+					case id = <-retryQueue:
+					case id = <-jobQueue:
+					}
+				}
 				acquire()
 				job := getJob(id)
-				if job != nil && !job.isCancelled() && !job.isPaused() {
+				if job != nil && !job.isCancelled() && !job.isPaused() && job.claim() {
 					runDownload(job)
+					job.unclaim()
 				}
 				release()
 			}
@@ -357,14 +402,17 @@ func buildDownloadArgs(job *Job) []string {
 	return base
 }
 
-var fatalErrRe = regexp.MustCompile(`(?i)unsupported url|video unavailable|private video|this video is private|not available in your country|has been removed|copyright|requested format is not available|http error 40[34]|invalid url|sign in to confirm|age-restricted`)
+var fatalErrRe = regexp.MustCompile(`(?i)unsupported url|private video|this video is private|not available in your country|unavailable in your country|has been removed|copyright|requested format is not available|http error 404|invalid url|sign in to confirm|age-restricted`)
 
-// classifyError: "fatal" — ретраить бессмысленно; "429" — перегрузка; "network" — временный сбой.
+// classifyError: "fatal" — ретраить бессмысленно; "429"/"403" — перегрузка (cooldown);
+// "network" — временный сбой (в т.ч. ложный «Video unavailable» при блокировках).
 func classifyError(msg string) string {
 	lower := strings.ToLower(msg)
 	switch {
 	case strings.Contains(lower, "429") || strings.Contains(lower, "too many requests"):
 		return "429"
+	case strings.Contains(lower, "http error 403"):
+		return "403"
 	case fatalErrRe.MatchString(lower):
 		return "fatal"
 	default:
@@ -403,7 +451,7 @@ func runDownload(job *Job) {
 
 	onProgress := func(st progressState) {
 		job.set(func() {
-			if job.Status == "cancelled" {
+			if job.Status == "cancelled" || job.Status == "paused" {
 				return
 			}
 			job.Status = "downloading"
@@ -439,7 +487,12 @@ func runDownload(job *Job) {
 				return
 			}
 			if strings.Contains(lastErr, "killed: paused") {
-				// юзер поставил на паузу — процесс убит, .part сохранён; тихо выходим
+				// юзер поставил на паузу — процесс убит, .part сохранён; статус мог быть
+				// перетёрт последним тиком прогресса — возвращаем paused
+				job.set(func() {
+					job.Status = "paused"
+					job.Stage = "paused"
+				})
 				return
 			}
 			kind := classifyError(lastErr)
@@ -463,17 +516,35 @@ func runDownload(job *Job) {
 		job.set(func() {
 			// юзер мог поставить на паузу, пока мы разбирались с ошибкой
 			if job.Status != "paused" {
-				job.Status = "queued"
-				job.Stage = "queued"
+				job.Status = "retry_wait"
+				job.Stage = "retry_wait"
 				job.Error = ""
+				job.NextRetryAt = time.Now().Add(delay)
 			}
 		})
 		if job.Status == "paused" {
 			return
 		}
+		// джоб вернётся в приоритетную очередь через backoff; слот освобождается сразу
 		go func(id string, d time.Duration) {
 			time.Sleep(d)
-			jobQueue <- id
+			j := getJob(id)
+			if j == nil {
+				return
+			}
+			j.mu.Lock()
+			if j.Status != "retry_wait" {
+				j.mu.Unlock()
+				return
+			}
+			j.Status = "queued"
+			j.Stage = "queued"
+			j.mu.Unlock()
+			select {
+			case retryQueue <- id:
+			default:
+				jobQueue <- id
+			}
 		}(job.JobID, delay)
 		return // слот освобождается; джоб сам вернётся в очередь
 	}
@@ -699,7 +770,7 @@ func pauseJob(id string) bool {
 		return false
 	}
 	job.set(func() {
-		if job.Status == "queued" || job.Status == "downloading" || job.Status == "processing" {
+		if job.Status == "queued" || job.Status == "downloading" || job.Status == "processing" || job.Status == "retry_wait" {
 			job.Status = "paused"
 			job.Stage = "paused"
 		}
@@ -713,23 +784,20 @@ func resumeJob(id string) bool {
 	if job == nil {
 		return false
 	}
-	job.set(func() {
-		if job.Status == "paused" {
-			job.Status = "queued"
-			job.Stage = "queued"
-			job.Error = ""
-		}
-	})
-	if job.Status == "queued" {
-		select {
-		case jobQueue <- id:
-		default:
-			// очередь полна — попробуем чуть позже
-			go func(i string) {
-				time.Sleep(3 * time.Second)
-				jobQueue <- i
-			}(id)
-		}
+	job.mu.Lock()
+	if job.Status != "paused" {
+		job.mu.Unlock()
+		return false
+	}
+	job.Status = "queued"
+	job.Stage = "queued"
+	job.Error = ""
+	job.mu.Unlock()
+
+	select {
+	case retryQueue <- id:
+	default:
+		jobQueue <- id
 	}
 	return true
 }
@@ -749,13 +817,13 @@ func pauseAllJobs() {
 	jobs.Lock()
 	ids := make([]string, 0, len(jobs.m))
 	for id := range jobs.m {
-		if s := jobStatus(id); s == "downloading" || s == "processing" {
-			ids = append(ids, id)
-		}
+		ids = append(ids, id)
 	}
 	jobs.Unlock()
 	for _, id := range ids {
-		pauseJob(id)
+		if s := jobStatus(id); s == "queued" || s == "downloading" || s == "processing" || s == "retry_wait" {
+			pauseJob(id)
+		}
 	}
 }
 
@@ -764,13 +832,13 @@ func resumeAllJobs() {
 	jobs.Lock()
 	ids := make([]string, 0, len(jobs.m))
 	for id := range jobs.m {
-		if jobStatus(id) == "paused" {
-			ids = append(ids, id)
-		}
+		ids = append(ids, id)
 	}
 	jobs.Unlock()
 	for _, id := range ids {
-		resumeJob(id)
+		if jobStatus(id) == "paused" {
+			resumeJob(id)
+		}
 	}
 }
 
