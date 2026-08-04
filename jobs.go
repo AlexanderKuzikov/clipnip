@@ -40,6 +40,8 @@ type Job struct {
 	Retries     int       // сетевые повторы (requeue)
 	NextRetryAt time.Time // когда retry_wait → queued
 	Running     bool      // защита от двойного запуска
+	Stuck       bool      // watchdog пометил зависшим (байты не растут)
+	LastDataAt  time.Time // последний рост downloaded_bytes
 
 	pidMu       sync.Mutex
 	pid         int
@@ -56,6 +58,12 @@ func (j *Job) isPaused() bool {
 	j.mu.RLock()
 	defer j.mu.RUnlock()
 	return j.Status == "paused"
+}
+
+func (j *Job) isStuck() bool {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	return j.Stuck
 }
 
 // claim захватывает джоб для запуска воркером (один запуск, даже если
@@ -129,6 +137,7 @@ const (
 	cooldown403    = 15 * time.Second
 	maxRetries     = 3            // повторов после сетевого отказа, дальше — error
 	retryBaseDelay = 5 * time.Second // backoff: 5с, 10с, 15с...
+	stuckTimeout   = 60 * time.Second // watchdog: нет роста байтов дольше stuckTimeout → джоб «завис»
 )
 
 var adapt = struct {
@@ -223,6 +232,44 @@ func adaptFailure(kind string) {
 	}
 	log.Printf("parallel: -> %d (failure: %s)", adapt.current, kind)
 	adapt.cond.Broadcast()
+}
+
+func startWatchdog() {
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for now := range ticker.C {
+			jobs.Lock()
+			ids := make([]string, 0, len(jobs.m))
+			for id := range jobs.m {
+				ids = append(ids, id)
+			}
+			jobs.Unlock()
+			for _, id := range ids {
+				job := getJob(id)
+				if job == nil {
+					continue
+				}
+				job.mu.RLock()
+				if job.Status != "downloading" || job.LastDataAt.IsZero() {
+					job.mu.RUnlock()
+					continue
+				}
+				lastData := job.LastDataAt
+				job.mu.RUnlock()
+				if now.Sub(lastData) > stuckTimeout {
+					log.Printf("watchdog: stuck job=%s no data for %s", id, now.Sub(lastData).Round(time.Second))
+					job.pidMu.Lock()
+					pid := job.pid
+					job.pidMu.Unlock()
+					if pid > 0 {
+						killTree(pid)
+					}
+					job.set(func() { job.Stuck = true })
+				}
+			}
+		}
+	}()
 }
 
 func startWorkers() {
@@ -461,6 +508,9 @@ func runDownload(job *Job) {
 			job.Total = st.Total
 			job.Speed = parseSpeed(st.Speed)
 			job.ETA = parseETA(st.ETA)
+			if st.Downloaded > 0 {
+				job.LastDataAt = time.Now()
+			}
 			if job.Total > 0 {
 				job.Progress = round1(float64(job.Downloaded) / float64(job.Total) * 100)
 			} else if job.Progress == 0 {
@@ -493,6 +543,16 @@ func runDownload(job *Job) {
 			job.set(func() {
 				job.Status = "paused"
 				job.Stage = "paused"
+			})
+			return
+		}
+		if job.isStuck() {
+			// watchdog пометил джоб зависшим (скачивание не идёт, байты не растут) —
+			// не рекьюим, сразу в error с понятным сообщением
+			job.set(func() {
+				job.Status = "error"
+				job.Stage = "error"
+				job.Error = "Download stuck — no data received for " + stuckTimeout.Round(time.Second).String() + ". YouTube не отдаёт файл."
 			})
 			return
 		}

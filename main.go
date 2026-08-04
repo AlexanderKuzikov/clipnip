@@ -22,6 +22,7 @@ func main() {
 	loadConfig()
 	cleanupStaleParts()
 	startWorkers()
+	startWatchdog()
 
 	if err := ensureBins(); err != nil {
 		log.Printf("bootstrap failed: %v", err)

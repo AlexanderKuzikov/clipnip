@@ -292,6 +292,7 @@
     }
 
     .card {
+      position: relative;
       display: flex;
       gap: 14px;
       border: 1.5px solid var(--card-border);
@@ -300,6 +301,15 @@
       padding: 14px;
       margin-bottom: 10px;
       animation: slideUp 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    .card-num {
+      position: absolute;
+      top: 6px;
+      right: 8px;
+      font-size: 0.62rem;
+      color: var(--muted);
+      letter-spacing: 0.04em;
     }
 
     @keyframes slideUp {
@@ -525,7 +535,7 @@
     .dl-all-bar {
       display: flex;
       gap: 10px;
-      margin-top: 16px;
+      margin-bottom: 15px;
     }
 
     .dl-all-btn {
@@ -1070,6 +1080,7 @@
         : '';
 
       el.innerHTML = `
+        <div class="card-num">#${idx + 1}</div>
         <div class="card-thumb">${thumbHtml}</div>
         <div class="card-body">
           <div class="card-title">${esc(c.title || 'Untitled')}</div>
