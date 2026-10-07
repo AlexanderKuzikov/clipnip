@@ -566,10 +566,11 @@ func TestClassifyError(t *testing.T) {
 		// троттлинг
 		"HTTP Error 429: Too Many Requests":  "throttle",
 		"[youtube] Video: Too Many Requests": "throttle",
-		// отказ отдачи: extractor отработал (в логе виден выбор форматов),
-		// но видеопоток не отдали — это устаревший движок, а не перегрузка
-		"unable to download video data: HTTP Error 403: Forbidden": "engine",
-		"unable to download api page: HTTP Error 403: Forbidden":   "engine",
+		// отказ передачи: форматы получены, но данные не пошли. Строка от
+		// yt-dlp НЕ различает видео и аудио — так что это указание лишь на
+		// «передачу отказали», а не на устаревший движок (см. errorHint)
+		"unable to download video data: HTTP Error 403: Forbidden": "stream",
+		"unable to download api page: HTTP Error 403: Forbidden":   "stream",
 		// отказ сайта: нужен бот-чек/cookies
 		"HTTP Error 403: Forbidden":                                       "site",
 		"Sign in to confirm you're not a bot. Use --cookies-from-browser": "site",
@@ -602,7 +603,7 @@ func TestClassifyError(t *testing.T) {
 // приложение само себя душило на сломанном движке.
 func TestFailureClassesAffectParallelism(t *testing.T) {
 	affects := []string{errThrottle, errNetwork}
-	touches := []string{errSite, errEngine, errFatal}
+	touches := []string{errSite, errStream, errFatal}
 	for _, k := range affects {
 		if !affectsParallelism(k) {
 			t.Errorf("%s must affect parallelism", k)
@@ -615,9 +616,6 @@ func TestFailureClassesAffectParallelism(t *testing.T) {
 		if affectsParallelism(k) {
 			t.Errorf("%s must NOT affect parallelism", k)
 		}
-	}
-	if retriable(errEngine) {
-		t.Error("stale engine is not fixed by retrying")
 	}
 	if retriable(errFatal) {
 		t.Error("fatal is not fixed by retrying")
@@ -653,14 +651,44 @@ func TestSiteRefusalKeepsPool(t *testing.T) {
 	adapt.Unlock()
 }
 
+// Подсказки не должны обвинять движок, если он свежее порога. Именно это
+// ложное утверждение показано пользователю на живом прогоне: nightly
+// 2026.09.27 был назван устаревшим.
 func TestErrorHint(t *testing.T) {
 	setCookies(false, "", "", false)
 	t.Cleanup(func() { setCookies(false, "", "", false) })
 
-	if errorHint(errEngine) == "" {
-		t.Error("stale engine needs a hint pointing at the rebuild")
+	streamHint := errorHint(errStream, "unable to download video data: HTTP Error 403", 0)
+	if streamHint == "" {
+		t.Fatal("stream refusal needs a hint")
 	}
-	siteHint := errorHint(errSite)
+	if enginePossiblyStale() {
+		t.Skip("engine on this machine is genuinely older than the known-good build")
+	}
+	if strings.Contains(streamHint, "older than the last build") {
+		t.Errorf("fresh engine must not be called stale: %q", streamHint)
+	}
+	for _, want := range []string{"Retry", "address"} {
+		if !strings.Contains(streamHint, want) {
+			t.Errorf("hint should mention %q, got %q", want, streamHint)
+		}
+	}
+
+	// Уже скачано — повтор не начнёт заново, и это надо сказать.
+	withPartial := errorHint(errStream, "unable to download video data: HTTP Error 403", 1141274957)
+	if !strings.Contains(withPartial, "nothing is lost") {
+		t.Errorf("hint must mention that the partial is kept, got %q", withPartial)
+	}
+	if !strings.Contains(withPartial, "1.1 GB") {
+		t.Errorf("hint should quote the partial size, got %q", withPartial)
+	}
+
+	stall := errorHint(errNetwork, "stalled: no progress", 241*1024*1024)
+	if !strings.Contains(stall, "VPN") {
+		t.Errorf("stall hint should name the VPN cause, got %q", stall)
+	}
+
+	siteHint := errorHint(errSite, "HTTP Error 403: Forbidden", 0)
 	if siteHint == "" {
 		t.Fatal("site refusal needs a hint pointing at cookies")
 	}
@@ -670,7 +698,7 @@ func TestErrorHint(t *testing.T) {
 
 	// Cookies уже включены: совет «включи cookies» уводит по кругу.
 	setCookies(true, "chrome", "", false)
-	active := errorHint(errSite)
+	active := errorHint(errSite, "HTTP Error 403: Forbidden", 0)
 	if active == siteHint {
 		t.Error("hint must differ when cookies are already enabled")
 	}
@@ -678,8 +706,43 @@ func TestErrorHint(t *testing.T) {
 		t.Errorf("circular advice when cookies are on: %q", active)
 	}
 
-	if h := errorHint(errNetwork); h != "" {
-		t.Errorf("network errors need no hint, got %q", h)
+	if h := errorHint(errNetwork, "Read timed out after 15000ms", 0); h != "" {
+		t.Errorf("plain network errors need no hint, got %q", h)
+	}
+}
+
+func TestVersionDate(t *testing.T) {
+	cases := map[string]int{
+		"2026.09.27.232945": 20260927,
+		"2026.08.19":        20260819,
+		"2026.07.04":        20260704,
+		"":                  0,
+		"nightly":           0,
+	}
+	for in, want := range cases {
+		if got := versionDate(in); got != want {
+			t.Errorf("versionDate(%q) = %d, want %d", in, got, want)
+		}
+	}
+	if !enginePossiblyStale() && versionDate("2020.01.01") >= versionDate(ytdlpKnownGoodSince) {
+		t.Error("sanity: 2020 must be older than the known-good build")
+	}
+}
+
+func TestPartialBytes(t *testing.T) {
+	dir := t.TempDir()
+	id := "job1"
+	if got := partialBytes(dir, id); got != 0 {
+		t.Errorf("empty dir must report 0, got %d", got)
+	}
+	if err := os.WriteFile(filepath.Join(dir, id+".f137.mp4.part"), make([]byte, 1000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, id+".f140.m4a.part"), make([]byte, 500), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := partialBytes(dir, id); got != 1500 {
+		t.Errorf("want sum of both components (1500), got %d", got)
 	}
 }
 

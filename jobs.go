@@ -503,28 +503,32 @@ func buildDownloadArgs(job *Job) []string {
 var fatalErrRe = regexp.MustCompile(`(?i)unsupported url|private video|this video is private|video unavailable|this video is not available|not available in your country|unavailable in your country|has been removed|copyright|requested format is not available|http error 404|invalid url`)
 
 // Классы ошибок. Различать важно, потому что лечатся они противоположно:
-// только троттлинг и сеть лечатся ожиданием и снижением параллельности,
-// а отказ сайта и отказ отдачи — конфигурацией (cookies) и обновлением движка.
+// троттлинг и сеть лечатся ожиданием и снижением параллельности, отказ
+// сайта — cookies, отказ в передаче данных — адресом и повтором.
 const (
 	errThrottle = "throttle" // 429 — превышен лимит, ждать и резать параллельность
-	errEngine   = "engine"   // extractor отработал, но поток данных не отдали → движок устарел
-	errSite     = "site"     // сайт отказал: бот-чек, нет авторизации, 403 на этапе extractor
+	errStream   = "stream"   // форматы получены, но передачу данных отказали
+	errSite     = "site"     // сайт отказал: бот-чек, нет авторизации, 403 на extractor
 	errFatal    = "fatal"    // ролика не существует/недоступен, ретрай бессмыслен
 	errNetwork  = "network"  // таймаут, обрыв, 5xx
 )
 
 // classifyError раскладывает ошибку yt-dlp по классу.
 //
-// Отказ медиапотока ловится раньше всего: строка "unable to download video data"
-// появляется только в загрузчике, то есть extractor уже вернул форматы. Любой
-// другой 403 — это отказ сайта, и ретраить его бессмысленно, а снижать
-// параллельность — вредно: так уже маскировал баг с устаревшим движком.
+// Отказ передачи ловится первым, потому что строка "unable to download video data"
+// встречается только в загрузчике, то есть форматы уже получены. **Важно:** сам
+// yt-dlp выводит её независимо от того, что качает — видео или аудио, — и при
+// отказе на втором компоненте скачивания сообщение то же самое. Поэтому это
+// указание лишь на «передачу отказали», а не на причину: 403 здесь бывает и от
+// устаревшего движка, и от репутации адреса (смена VPN, лимит на IP), и от
+// истёкшей подписи на очень большом файле. Причину выбирает errorHint, сверяясь
+// с фактической версией движка.
 func classifyError(msg string) string {
 	lower := strings.ToLower(msg)
 	switch {
 	case strings.Contains(lower, "unable to download video data"),
 		strings.Contains(lower, "unable to download api page"):
-		return errEngine
+		return errStream
 	case strings.Contains(lower, "429"), strings.Contains(lower, "too many requests"):
 		return errThrottle
 	case strings.Contains(lower, "sign in to confirm"),
@@ -556,19 +560,89 @@ func affectsParallelism(kind string) bool {
 }
 
 // errorHint — что предложить пользователю по классу ошибки.
-// Подсказка про cookies бессмысленна, если cookies уже включены: тогда
-// совет «включи cookies» уводит по кругу. Проверено на живом прогоне.
-func errorHint(kind string) string {
+//
+// Здесь была ложь: строка отказа передачи однозначно трактовалась как
+// «движок устарел», и на живом прогоне (nightly 2026.09.27) ClipNip утверждал
+// это про свежий движок. Теперь утверждение проверяется версией на диске, а
+// при свежем движке называется настоящая причина: адрес. resumed — размер уже
+// скачанного, чтобы человек знал, что повтор не начнёт заново.
+func errorHint(kind, msg string, resumed int64) string {
 	switch kind {
-	case errEngine:
-		return "The embedded yt-dlp is too old for this site and cannot fetch the stream. Rebuild ClipNip to update the engine."
+	case errStream:
+		if enginePossiblyStale() {
+			return "The embedded yt-dlp is older than the last build known to work with YouTube's current player clients. Rebuild ClipNip to update the engine."
+		}
+		hint := "YouTube found the video but refused to send the stream. On an up-to-date engine this is the address: switching VPN mid-download, a shared or already-exhausted VPN exit, or a link that expired on a very large file. Pick a stable connection and press Retry"
+		if resumed > 0 {
+			hint += " — it continues from " + humanBytes(resumed) + ", nothing is lost."
+		} else {
+			hint += "."
+		}
+		return hint
+
 	case errSite:
 		if cookiesActive() {
 			return "The site refused the request even with cookies enabled. The session may have expired, the wrong browser profile may be selected, or the site wants different credentials."
 		}
 		return "The site refused the request. Enabling cookies in settings usually fixes this (the site wants a logged-in session)."
+
+	case errNetwork:
+		if strings.Contains(strings.ToLower(msg), "stalled") {
+			hint := "No data arrived for the whole timeout. Switching VPN or a dropped tunnel looks exactly like this — try another node without touching the connection while it downloads."
+			if resumed > 0 {
+				hint += " Retry continues from " + humanBytes(resumed) + "."
+			}
+			return hint
+		}
 	}
 	return ""
+}
+
+// ytdlpKnownGoodSince — сборка, с которой extractor работает с текущим набором
+// player-клиентов YouTube. Ниже этой даты совет «пересобери ClipNip» уместен,
+// выше — заведомо неверен. Без такого порога приложение называло устаревшим
+// движок, который свежее всего, что существует.
+const ytdlpKnownGoodSince = "2026.06.01"
+
+var verDateRe = regexp.MustCompile(`^(\d{4})\.(\d{2})\.(\d{2})`)
+
+// versionDate превращает "2026.09.27.232945" в 20260927: ночные сборки несут
+// суффикс, из-за которого прямое сравнение строк не работает.
+func versionDate(v string) int {
+	m := verDateRe.FindStringSubmatch(strings.TrimSpace(v))
+	if m == nil {
+		return 0
+	}
+	y, _ := strconv.Atoi(m[1])
+	mo, _ := strconv.Atoi(m[2])
+	d, _ := strconv.Atoi(m[3])
+	return y*10000 + mo*100 + d
+}
+
+// enginePossiblyStale — версия на диске старше последней известной рабочей.
+// Если версию узнать не удалось, не утверждаем ничего: неизвестность не
+// повод обвинять движок.
+func enginePossiblyStale() bool {
+	v, _, _ := probeEngine()
+	dv := versionDate(v)
+	if dv == 0 {
+		return false
+	}
+	return dv < versionDate(ytdlpKnownGoodSince)
+}
+
+// partialBytes — уже скачанный объём по джобу (сумма .part/.ytdl).
+func partialBytes(dir, id string) int64 {
+	var sum int64
+	for _, pattern := range []string{id + ".*.part", id + ".part", id + ".*.ytdl", id + ".ytdl"} {
+		matches, _ := filepath.Glob(filepath.Join(dir, pattern))
+		for _, p := range matches {
+			if fi, err := os.Stat(p); err == nil {
+				sum += fi.Size()
+			}
+		}
+	}
+	return sum
 }
 
 func runDownload(job *Job) {
@@ -815,7 +889,7 @@ func runDownload(job *Job) {
 			job.Status = "error"
 			job.Stage = "error"
 			job.Error = lastErr
-			job.ErrorHint = errorHint(kind)
+			job.ErrorHint = errorHint(kind, lastErr, partialBytes(dir, job.JobID))
 		})
 		log.Printf("download failed job=%s url=%s kind=%s: %s", job.JobID, job.URL, kind, lastErr)
 		return
