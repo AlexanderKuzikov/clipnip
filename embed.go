@@ -1,13 +1,12 @@
 package main
 
 import (
-	"embed"
 	"io/fs"
 )
 
-//go:embed web embedded
-var assetsDir embed.FS
-
+// webRoot — общий доступ к вшитым файлам интерфейса. Сам assetsDir
+// объявляется в embed_full.go / embed_slim.go: набор встроенных бинарников
+// зависит от тега сборки.
 var webRoot fs.FS
 
 func webFiles() fs.FS {

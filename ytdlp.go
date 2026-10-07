@@ -4,10 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,7 +26,6 @@ import (
 const (
 	ytdlpGz  = "embedded/yt-dlp.exe.gz"
 	ffmpegGz = "embedded/ffmpeg.exe.gz"
-	denoGz   = "embedded/deno.exe.gz"
 
 	// ytdlpVersion — версия вшитого yt-dlp. Сверяется с маркером рядом с
 	// распакованным бинарником: смена версии в embed принудительно
@@ -90,20 +92,112 @@ func probeEngine() (string, bool, bool) {
 	return engineInfo.version, engineInfo.ffmpeg, engineInfo.deno
 }
 
-// ensureBins распаковывает yt-dlp и ffmpeg из embed при первом запуске.
+// binSpec — встроенный бинарник. sha256 обязателен для всего, чем ClipNip
+// управляет сам: содержимое embed — единственный источник истины, а файл в
+// %LOCALAPPDATA%\clipnip\bin лежит в пользовательской зоне. Пустой sha256
+// означает «не проверять» — так у ffmpeg оставлен ручной путь обновления.
+type binSpec struct {
+	name    string
+	gz      string
+	version string
+	sha256  string
+}
+
+// embeddedBins — компоненты, которыми ClipNip управляет сам. Порядок не важен.
+// deno присутствует только в полной сборке: в облегчённой denoGz пуст, и
+// компонент пропускается целиком.
+var embeddedBins = []binSpec{
+	{"yt-dlp.exe", ytdlpGz, ytdlpVersion, "997c00e8f8ed91431b1ddaeeae519743602beb0b6df0903194a2632e57df1b31"},
+	{"deno.exe", denoGz, denoVersion, "e020f3e232bd16e33768dee528e5983349c962952051ced0a5d58ad42f5d9b33"},
+	{"ffmpeg.exe", ffmpegGz, "", ""},
+}
+
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// ensureBins распаковывает бинарники из embed и сверяет их целостность.
 func ensureBins() error {
 	dir, err := binDir()
 	if err != nil {
 		return err
 	}
-	if err := extractEmbedded(dir, ytdlpGz, "yt-dlp.exe", ytdlpVersion); err != nil {
-		return fmt.Errorf("yt-dlp extract: %w", err)
+	for _, b := range embeddedBins {
+		if err := extractEmbedded(dir, b); err != nil {
+			return fmt.Errorf("%s: %w", b.name, err)
+		}
 	}
-	if err := extractEmbedded(dir, ffmpegGz, "ffmpeg.exe", ""); err != nil {
-		return fmt.Errorf("ffmpeg extract: %w", err)
+	return nil
+}
+
+// extractEmbedded распаковывает бинарник и проверяет SHA-256 результата.
+// Пустой gz означает «компонент не вшит в эту сборку» — пропускаем.
+//
+// Проверка обязательна по соображениям безопасности, а не только ради
+// целостности: раньше файл считался годным по одному маркеру версии, то есть
+// подмена файла в пользовательской папке осталась бы незамеченной и код из
+// неё исполнился бы при следующем старте. Несовпадение — это перераспаковка
+// из embed, а не запуск.
+func extractEmbedded(dir string, b binSpec) error {
+	if b.gz == "" {
+		return nil
 	}
-	if err := extractEmbedded(dir, denoGz, "deno.exe", denoVersion); err != nil {
-		return fmt.Errorf("deno extract: %w", err)
+	dest := filepath.Join(dir, b.name)
+
+	if b.sha256 != "" {
+		if sum, err := fileSHA256(dest); err == nil && sum == b.sha256 {
+			return nil
+		} else if err == nil {
+			log.Printf("integrity: %s differs on disk, re-extracting from embed", b.name)
+		}
+	} else if _, err := os.Stat(dest); err == nil {
+		return nil // без хеша доверяем файлу как есть (ручное обновление)
+	}
+
+	gz, err := assetsDir.Open(b.gz)
+	if err != nil {
+		return err
+	}
+	defer gz.Close()
+
+	zr, err := gzip.NewReader(gz)
+	if err != nil {
+		return err
+	}
+	defer zr.Close()
+
+	tmp := dest + ".tmp"
+	out, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	h := sha256.New()
+	_, err = io.Copy(io.MultiWriter(out, h), zr)
+	out.Close()
+	if err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if b.sha256 != "" {
+		if got := hex.EncodeToString(h.Sum(nil)); got != b.sha256 {
+			os.Remove(tmp)
+			return fmt.Errorf("embedded %s hash mismatch: got %s, want %s", b.name, got, b.sha256)
+		}
+	}
+	if err := os.Rename(tmp, dest); err != nil {
+		return err
+	}
+	if b.version != "" {
+		os.WriteFile(dest+".ver", []byte(b.version), 0o644)
 	}
 	return nil
 }
@@ -131,52 +225,6 @@ func ffmpegPath(dir string) string {
 		return ""
 	}
 	return p
-}
-
-func extractEmbedded(dir, gzPath, destName, version string) error {
-	dest := filepath.Join(dir, destName)
-	marker := dest + ".ver"
-
-	if version != "" {
-		if cur, err := os.ReadFile(marker); err == nil && string(cur) == version {
-			if _, err := os.Stat(dest); err == nil {
-				return nil
-			}
-		}
-	} else if _, err := os.Stat(dest); err == nil {
-		return nil
-	}
-
-	gz, err := assetsDir.Open(gzPath)
-	if err != nil {
-		return err
-	}
-	defer gz.Close()
-
-	zr, err := gzip.NewReader(gz)
-	if err != nil {
-		return err
-	}
-	defer zr.Close()
-
-	tmp := dest + ".tmp"
-	out, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	_, err = io.Copy(out, zr)
-	out.Close()
-	if err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, dest); err != nil {
-		return err
-	}
-	if version != "" {
-		os.WriteFile(marker, []byte(version), 0o644)
-	}
-	return nil
 }
 
 var errStripRe = regexp.MustCompile(`(?m)^ERROR:\s*`)

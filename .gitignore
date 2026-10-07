@@ -8,3 +8,5 @@
 *.key
 *.pem
 credentials*
+
+/clipnip-slim.exe

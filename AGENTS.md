@@ -5,7 +5,8 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
 ## Commands
 
 - build: `go build -ldflags="-s -w -H windowsgui" -o clipnip.exe .`
-- test: `go test ./...`
+- build-slim: `go build -tags clipnipslim -ldflags="-s -w -H windowsgui" -o clipnip-slim.exe .` (60 MB, без вшитого deno — меньше вложенных PE, слабее сигнатура дроппера для AV; подробнее `SECURITY.md`)
+- test: `go test ./...` (и `-tags clipnipslim` при правках embed)
 - vet: `go vet ./...`
 - headless-API: `$env:CLIPNIP_HEADLESS="1"; $env:CLIPNIP_PORT="8899"; .\clipnip.exe` → `http://127.0.0.1:8899/` (через curl — Invoke-RestMethod на loopback падает из-за прокси)
 
@@ -14,6 +15,7 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
 - Коммиты прямо в main, повелительное наклонение, ≤72 символа.
 - UI — в `web/`, вшивается через `//go:embed web`; шрифты локальные (без внешних CDN).
 - Сборка ТОЛЬКО с `-H windowsgui` — иначе чёрное консольное окно.
+- Набор вшитых бинарников зависит от тега сборки: `assetsDir` живёт в `embed_full.go` / `embed_slim.go`, а `denoGz` — в `deno_embed.go` / `deno_embed_slim.go`. Встраивать всё через `//go:embed embedded` нельзя: каталог тянется целиком и теряет смысл облегчённой сборки.
 
 ## Structure
 
@@ -35,14 +37,15 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
 - `ytdlp.go` — subprocess yt-dlp, прогресс-парсер, stall-детект (20 с без прогресса → kill+retry), распаковка из embed, kill-tree, `probeEngine()` (версия движка, кэш, вызывается из main и `/api/engine`). Плейлисты: `--flat-playlist --playlist-items 1-500`, таймаут 90 с. `--ignore-config` во всех трёх вызовах.
 - `netprobe.go` — `probeReach` (DNS + TCP:443), `probeReachAsync` (гонка с `/api/info`), `waitReach`, `envProxySet`. Вердикты: `ok` / `dns` / `tcp` / `proxy` / `unknown`.
 - `persist.go` — `queue.json` (состав очереди, не стейт-машина): `persistQueue` (вызывается из `defer` в `runDownload`, из `cancelJob` и при постановке в очередь), `restoreQueue` (до старта воркеров, с валидацией записей).
-- `embedded/*.gz` — gzip-архивы yt-dlp.exe, ffmpeg.exe и deno.exe, вшиты через `//go:embed`. Распаковка в `%LOCALAPPDATA%\clipnip\bin\` при первом запуске (ensureBins). yt-dlp и deno перезаписываются, только если их версия в константах `ytdlpVersion`/`denoVersion` не совпадает с маркером `*.ver`; ffmpeg не перезаписывается никогда (ручное обновление). Склейка видео+аудио идёт через `--ffmpeg-location` на binDir — ffmpeg в PATH не нужен.
+- `embedded/*.gz` — gzip-архивы yt-dlp.exe, ffmpeg.exe и deno.exe, вшиты через `//go:embed`. Распаковка в `%LOCALAPPDATA%\clipnip\bin\` при первом запуске (ensureBins). **Каждый компонент сверяется по SHA-256 с эталоном из `embeddedBins`; несовпадение → перераспаковка из embed, запуск подменённого файла исключён.** Сверить хеш надо после замены `.gz`, иначе старт упадёт. ffmpeg сверху не проверяется — под него оставлен ручной путь обновления. Подробности — `SECURITY.md`.
 - `jsRuntimeArgs(dir)` — `--js-runtimes deno:<binDir>`; deno нужен для yt-dlp-ejs. **Проверено:** без него JS-рантайма на машине нет вообще (node/bun/quickjs отсутствуют), и при этом yt-dlp и так находит deno рядом со своим exe — флаг держим как страховку, а не как необходимое условие.
 
 ## Обновление вшитых бинарников
 
-1. Скачать свежие `yt-dlp.exe`, `ffmpeg.exe` (GitHub / gyan.dev) и `deno.exe` (релиз denoland/deno, ассет `deno-x86_64-pc-windows-msvc.zip`). Только стабильный релиз: ассеты nightly удаляются, монобинарник их не переживёт.
+1. Скачать свежие `yt-dlp.exe`, `ffmpeg.exe` (GitHub / gyan.dev) и `deno.exe` (релиз denoland/deno, ассет `deno-x86_64-pc-windows-msvc.zip`). Только стабильный релиз yt-dlp — см. ADR 006 про канал.
 2. Запаковать в `embedded/` (имена: `yt-dlp.exe.gz`, `ffmpeg.exe.gz`, `deno.exe.gz`). `gzip` в PowerShell нет — пакуй любым gzip-инструментом (git bash, 7-Zip, python `gzip`). deno.exe уже упакован: gzip даёт 42.6 MB из 97.5 MB, экономить не на чем.
-3. **Поднять константы `ytdlpVersion` и `denoVersion` в `ytdlp.go`** под новые версии. Без этого бинарники не переедут к уже установленному приложению.
+3. **Поднять константы `ytdlpVersion` и `denoVersion` в `ytdlp.go`** под новые версии.
+4. **Обновить SHA-256 в `embeddedBins`** для yt-dlp и deno. Хеш берётся с уже распакованного файла в `%LOCALAPPDATA%\clipnip\bin\`. Забытый шаг — приложение не стартует: сверка целостности отвергнет расхождение.
 4. Пересобрать exe. ffmpeg обновлять не обязательно (yt-dlp обновляется чаще).
 
 ## Do NOT touch

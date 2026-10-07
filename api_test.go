@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -743,6 +744,61 @@ func TestPartialBytes(t *testing.T) {
 	}
 	if got := partialBytes(dir, id); got != 1500 {
 		t.Errorf("want sum of both components (1500), got %d", got)
+	}
+}
+
+// Хеши в binSpec переносятся руками, а обрезанный хеш не ловится сравнением
+// «на глаз»: при проверке целостности он даёт заведомо ложное «подменённый
+// файл». Поэтому длина и алфавит проверяются отдельно.
+func TestEmbeddedHashesWellFormed(t *testing.T) {
+	if len(embeddedBins) < 3 {
+		t.Fatalf("want at least yt-dlp, deno, ffmpeg, got %d", len(embeddedBins))
+	}
+	seen := map[string]string{}
+	for _, b := range embeddedBins {
+		if b.name == "" || b.gz == "" {
+			t.Errorf("bin without name/source: %+v", b)
+		}
+		if b.sha256 == "" {
+			t.Logf("%s: без проверки целостности (ручное обновление)", b.name)
+			continue
+		}
+		if len(b.sha256) != 64 {
+			t.Errorf("%s: hash must be 64 hex chars, got %d", b.name, len(b.sha256))
+		}
+		if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(b.sha256) {
+			t.Errorf("%s: hash must be lowercase hex", b.name)
+		}
+		if prev, dup := seen[b.sha256]; dup {
+			t.Errorf("%s and %s share a hash — copy/paste error", b.name, prev)
+		}
+		seen[b.sha256] = b.name
+	}
+}
+
+func TestFileSHA256DetectsChange(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "f.exe")
+	if err := os.WriteFile(p, []byte("original"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	first, err := fileSHA256(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	same, _ := fileSHA256(p)
+	if first != same {
+		t.Error("hash must be stable for unchanged file")
+	}
+	if err := os.WriteFile(p, []byte("TAMPERED"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	changed, _ := fileSHA256(p)
+	if changed == first {
+		t.Error("hash must change after tampering")
+	}
+	if _, err := fileSHA256(filepath.Join(dir, "missing.exe")); err == nil {
+		t.Error("missing file must return an error")
 	}
 }
 
