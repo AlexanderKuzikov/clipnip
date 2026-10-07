@@ -42,13 +42,13 @@ type Job struct {
 	// actionable-сообщение, не разбирая чужую строку в браузере.
 	ErrorHint string
 
-	Retries       int       // сетевые повторы (requeue)
-	NextRetryAt   time.Time // когда retry_wait → queued
-	FirstRetryAt  time.Time // начало цепочки ретраев (для потолка retryTotalTimeout)
-	Running       bool      // защита от двойного запуска
-	Stuck         bool      // watchdog пометил зависшим (байты не растут)
-	LastDataAt    time.Time // последний рост downloaded_bytes
-	Force         bool      // одноразовый обход пропуска «уже скачано» (Download anyway)
+	Retries      int       // сетевые повторы (requeue)
+	NextRetryAt  time.Time // когда retry_wait → queued
+	FirstRetryAt time.Time // начало цепочки ретраев (для потолка retryTotalTimeout)
+	Running      bool      // защита от двойного запуска
+	Stuck        bool      // watchdog пометил зависшим (байты не растут)
+	LastDataAt   time.Time // последний рост downloaded_bytes
+	Force        bool      // одноразовый обход пропуска «уже скачано» (Download anyway)
 
 	pidMu       sync.Mutex
 	pid         int
@@ -142,15 +142,15 @@ var retryQueue = make(chan string, 256)
 // ---- адаптивная параллельность ----
 
 const (
-	startParallel  = 8  // стартовый уровень
-	maxParallel    = 10 // жёсткий потолок (YouTube режет при большом числе сессий)
-	minParallel    = 1  // пол
-	successStep    = 15 // +1 за N успешных подряд
-	failDivisor    = 2  // ÷N при сетевом отказе
-	cooldown429    = 30 * time.Second
-	maxRetries     = 2            // повторов после сетевого отказа, дальше — error
-	retryBaseDelay = 5 * time.Second // backoff: 5с, 10с...
-	stuckTimeout   = 60 * time.Second // watchdog: нет роста байтов дольше stuckTimeout → джоб «завис»
+	startParallel     = 8  // стартовый уровень
+	maxParallel       = 10 // жёсткий потолок (YouTube режет при большом числе сессий)
+	minParallel       = 1  // пол
+	successStep       = 15 // +1 за N успешных подряд
+	failDivisor       = 2  // ÷N при сетевом отказе
+	cooldown429       = 30 * time.Second
+	maxRetries        = 2                // повторов после сетевого отказа, дальше — error
+	retryBaseDelay    = 5 * time.Second  // backoff: 5с, 10с...
+	stuckTimeout      = 60 * time.Second // watchdog: нет роста байтов дольше stuckTimeout → джоб «завис»
 	retryTotalTimeout = 90 * time.Second // потолок суммарного времени в retry_wait → error
 )
 

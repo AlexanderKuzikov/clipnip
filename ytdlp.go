@@ -23,19 +23,21 @@ import (
 const (
 	ytdlpGz  = "embedded/yt-dlp.exe.gz"
 	ffmpegGz = "embedded/ffmpeg.exe.gz"
+	denoGz   = "embedded/deno.exe.gz"
 
 	// ytdlpVersion — версия вшитого yt-dlp. Сверяется с маркером рядом с
 	// распакованным бинарником: смена версии в embed принудительно
 	// перераспаковывает файл (extractEmbedded иначе не перезаписывает).
 	ytdlpVersion = "2026.08.19"
+	denoVersion  = "2.9.7"
 )
 
 type progressState struct {
-	Percent  string
-	Speed    string
-	ETA      string
+	Percent    string
+	Speed      string
+	ETA        string
 	Downloaded int64
-	Total    int64
+	Total      int64
 }
 
 func binDir() (string, error) {
@@ -56,15 +58,16 @@ var engineInfo = struct {
 	sync.Mutex
 	version string
 	ffmpeg  bool
+	deno    bool
 	done    bool
 }{}
 
 // probeEngine один раз спрашивает версию у движка (~1.5 с), результат кэшируется.
-func probeEngine() (string, bool) {
+func probeEngine() (string, bool, bool) {
 	engineInfo.Lock()
 	defer engineInfo.Unlock()
 	if engineInfo.done {
-		return engineInfo.version, engineInfo.ffmpeg
+		return engineInfo.version, engineInfo.ffmpeg, engineInfo.deno
 	}
 	engineInfo.done = true
 
@@ -79,8 +82,9 @@ func probeEngine() (string, bool) {
 			engineInfo.version = strings.TrimSpace(out.String())
 		}
 		engineInfo.ffmpeg = ffmpegPath(dir) != ""
+		engineInfo.deno = len(jsRuntimeArgs(dir)) > 0
 	}
-	return engineInfo.version, engineInfo.ffmpeg
+	return engineInfo.version, engineInfo.ffmpeg, engineInfo.deno
 }
 
 // ensureBins распаковывает yt-dlp и ffmpeg из embed при первом запуске.
@@ -95,7 +99,26 @@ func ensureBins() error {
 	if err := extractEmbedded(dir, ffmpegGz, "ffmpeg.exe", ""); err != nil {
 		return fmt.Errorf("ffmpeg extract: %w", err)
 	}
+	if err := extractEmbedded(dir, denoGz, "deno.exe", denoVersion); err != nil {
+		return fmt.Errorf("deno extract: %w", err)
+	}
 	return nil
+}
+
+// jsRuntimeArgs указывает yt-dlp, где лежит вшитый deno.
+//
+// deno нужен для yt-dlp-ejs (JS-челленджи YouTube). Проверено на этой машине:
+// без этого флага yt-dlp тоже находит deno — он ищет рантайм рядом со своим
+// собственным exe, а binDir это и есть каталог с yt-dlp. То есть флаг не
+// обязателен, а страховка от смены этого поведения. Оставлять нечем: node на
+// машине отсутствует (yt-dlp пишет "node (unavailable)"), так что если бы
+// deno не подхватился автоматически, JS-рантайма не было бы вообще никакого.
+func jsRuntimeArgs(dir string) []string {
+	p := filepath.Join(dir, "deno.exe")
+	if _, err := os.Stat(p); err != nil {
+		return nil
+	}
+	return []string{"--js-runtimes", "deno:" + p}
 }
 
 // ffmpegPath — путь к распакованному ffmpeg, "" если его нет.
@@ -178,6 +201,7 @@ func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 		"--ignore-config",
 		"--progress-template", progressTemplate,
 	}, args...)
+	args = append(args, jsRuntimeArgs(dir)...)
 
 	// склейка видео+аудио идёт через ffmpeg из binDir, а не из PATH
 	if ff := ffmpegPath(dir); ff != "" {
@@ -318,9 +342,11 @@ func infoJSON(url string, playlist bool) (map[string]any, error) {
 	if playlist {
 		// плейлист: берём первые 500 записей, таймаут шире
 		args = append(args, "--flat-playlist", "--playlist-items", "1-500")
-	} else {
-		args = append(args, "--no-playlist")
 	}
+	// --no-playlist намеренно НЕ передаётся: yt-dlp сам различает ссылку на
+	// одно видео и на страницу с несколькими (один элемент → одно видео).
+	// Принудительный флаг молча урезал такие страницы до одного ролика.
+	args = append(args, jsRuntimeArgs(dir)...)
 	args = append(args, cookieArgs()...)
 	args = append(args, url)
 
@@ -380,6 +406,7 @@ func fetchTitle(url string) (string, error) {
 	ytdlp := filepath.Join(dir, "yt-dlp.exe")
 
 	args := []string{"--no-warnings", "--ignore-config", "--no-playlist", "--print", "title"}
+	args = append(args, jsRuntimeArgs(dir)...)
 	args = append(args, cookieArgs()...)
 	args = append(args, url)
 

@@ -29,7 +29,7 @@ func main() {
 		fatalBox(err)
 		return
 	}
-	if version, hasFFmpeg := probeEngine(); version != "" {
+	if version, hasFFmpeg, hasDeno := probeEngine(); version != "" {
 		if version != ytdlpVersion {
 			log.Printf("engine: yt-dlp %s (embedded %s, differs)", version, ytdlpVersion)
 		} else {
@@ -37,6 +37,11 @@ func main() {
 		}
 		if !hasFFmpeg {
 			log.Printf("engine: ffmpeg missing — merging video+audio will fail")
+		}
+		if !hasDeno {
+			log.Printf("engine: deno missing — some YouTube formats may be unavailable")
+		} else {
+			log.Printf("engine: deno %s", denoVersion)
 		}
 	}
 

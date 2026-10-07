@@ -130,12 +130,13 @@ func newAPI() http.Handler {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
 			return
 		}
-		version, hasFFmpeg := probeEngine()
+		version, hasFFmpeg, hasDeno := probeEngine()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"version":  version,
 			"embedded": ytdlpVersion,
 			"stale":    version != "" && version != ytdlpVersion,
 			"ffmpeg":   hasFFmpeg,
+			"deno":     hasDeno,
 		})
 	})
 
@@ -585,6 +586,36 @@ func floatOf(v any) float64 {
 	return 0
 }
 
+// buildQualityList собирает список качеств из форматов yt-dlp.
+//
+// В yt-dlp 2026.08+ прогрессивных форматов (18/22) больше нет — остались
+// DASH (https) и HLS (m3u8). Наивный выбор «max tbr на высоту» стабильно
+// отдавал m3u8: у HLS битрейт всегда выше, а у него total_bytes иногда NA,
+// из-за чего прогресс-бар теряет точность. Поэтому при равной высоте
+// https-DASH предпочтительнее, и выбор идёт уже по tbr.
+// betterFormat: https-DASH предпочтительнее m3u8, дальше по tbr.
+// Высота уже совпадает — сравниваем только формат одного уровня.
+func betterFormat(cand, cur map[string]any) bool {
+	ch, chOK := isHLSFormat(cand)
+	uh, uhOK := isHLSFormat(cur)
+	if chOK && uhOK && ch != uh {
+		// протоколы известны и различаются: https выигрывает у m3u8,
+		// поэтому «лучше» здесь — обратное признаку «кандидат m3u8»
+		return !ch
+	}
+	return floatOf(cand["tbr"]) > floatOf(cur["tbr"])
+}
+
+func isHLSFormat(fm map[string]any) (hls bool, known bool) {
+	switch strings.ToLower(str(fm["protocol"])) {
+	case "https":
+		return false, true
+	case "m3u8", "m3u8_native", "http":
+		return true, true
+	}
+	return false, false
+}
+
 func buildQualityList(info map[string]any) []map[string]any {
 	rawFormats, _ := info["formats"].([]any)
 	bestByHeight := map[int64]map[string]any{}
@@ -600,7 +631,7 @@ func buildQualityList(info map[string]any) []map[string]any {
 			continue
 		}
 		cur, ok := bestByHeight[height]
-		if !ok || floatOf(fm["tbr"]) > floatOf(cur["tbr"]) {
+		if !ok || betterFormat(fm, cur) {
 			bestByHeight[height] = fm
 		}
 	}

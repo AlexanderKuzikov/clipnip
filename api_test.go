@@ -301,6 +301,76 @@ func TestCookiesEndpoints(t *testing.T) {
 	}
 }
 
+// После появления HLS наивный выбор «max tbr на высоту» отдавал m3u8:
+// битрейт у HLS всегда выше, а total_bytes у него иногда NA — прогресс-бар
+// терял точность. При равной высоте должен побеждать https-DASH.
+func TestQualityPrefersDashOverHLS(t *testing.T) {
+	httpsFmt := map[string]any{
+		"format_id": "137", "ext": "mp4", "height": 1080.0,
+		"vcodec": "avc1.640028", "protocol": "https", "tbr": 3038.0,
+	}
+	hlsFmt := map[string]any{
+		"format_id": "270", "ext": "mp4", "height": 1080.0,
+		"vcodec": "avc1.640028", "protocol": "m3u8", "tbr": 4688.0,
+	}
+
+	if !betterFormat(httpsFmt, hlsFmt) {
+		t.Error("https must win over m3u8 at equal height despite lower tbr")
+	}
+	if betterFormat(hlsFmt, httpsFmt) {
+		t.Error("m3u8 must not win over https at equal height")
+	}
+
+	info := map[string]any{"formats": []any{hlsFmt, httpsFmt}}
+	list := buildQualityList(info)
+	if len(list) != 1 {
+		t.Fatalf("want 1 quality, got %d: %v", len(list), list)
+	}
+	if list[0]["id"] != "137" {
+		t.Errorf("want format 137 (https), got %v", list[0]["id"])
+	}
+}
+
+func TestQualityFallsBackToTBR(t *testing.T) {
+	// Оба формата одного протокола — решает битрейт.
+	low := map[string]any{"format_id": "a", "ext": "mp4", "height": 720.0,
+		"vcodec": "avc1", "protocol": "https", "tbr": 500.0}
+	high := map[string]any{"format_id": "b", "ext": "mp4", "height": 720.0,
+		"vcodec": "avc1", "protocol": "https", "tbr": 900.0}
+	if !betterFormat(high, low) {
+		t.Error("higher tbr must win within same protocol")
+	}
+
+	// Неизвестный протокол не должен ломать сравнение.
+	unknownLow := map[string]any{"format_id": "c", "height": 720.0, "tbr": 100.0}
+	unknownHigh := map[string]any{"format_id": "d", "height": 720.0, "tbr": 200.0}
+	if !betterFormat(unknownHigh, unknownLow) {
+		t.Error("unknown protocols must fall back to tbr")
+	}
+	if betterFormat(unknownLow, unknownHigh) {
+		t.Error("unknown protocols must not ignore tbr")
+	}
+}
+
+// deno должен попадать в binDir и указываться yt-dlp явным путём:
+// binDir не в PATH, а по умолчанию yt-dlp включает только deno из PATH.
+func TestJsRuntimeArgsPointsAtEmbeddedDeno(t *testing.T) {
+	dir := t.TempDir()
+	if got := jsRuntimeArgs(dir); got != nil {
+		t.Errorf("no deno on disk must yield no args, got %v", got)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "deno.exe"), []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got := jsRuntimeArgs(dir)
+	if len(got) != 2 || got[0] != "--js-runtimes" {
+		t.Fatalf("bad js-runtime args: %v", got)
+	}
+	if !strings.HasPrefix(got[1], "deno:") || !strings.Contains(got[1], dir) {
+		t.Errorf("must point at the embedded deno by path, got %q", got[1])
+	}
+}
+
 func TestPlaylistDetection(t *testing.T) {
 	cases := map[string]bool{
 		"https://www.youtube.com/playlist?list=PL7I7TsNvvxnN95A4teM8_Qn4-dbB0mz3l": true,

@@ -33,13 +33,14 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
 - `jobs.go` — джобы в памяти; **таксономия ошибок 5 классов** (`classifyError`): `throttle` / `engine` (extractor отработал, поток не отдали → движок устарел) / `site` (отказ сайта: бот-чек, нет авторизации) / `fatal` / `network`. `affectsParallelism` — только throttle+network режут пул и берут cooldown (30 с при 429); `retriable` — кроме engine и fatal; `errorHint` → actionable-текст в UI. Адаптивная параллельность (старт 8, потолок 10, пол 1; +1 за 15 успешных; ÷2 при throttle/network), очередь 1024 + приоритетная retryQueue; сетевой отказ → requeue с backoff 5с×N (до 2 повторов, потолок суммарно 90 с); watchdog 60 с без роста байтов → kill + error; кнопка Retry только для фатальных; чистка `.part` старше 24 ч; пропуск уже скачанных: перед стартом yt-dlp проверка `title` + расширение режима в папке загрузки → статус `skipped` (обход — флаг `force` в /api/download, «Download anyway»); имя файла — title из /api/info (фолбэк: fetchTitle, 15 c), переименование с защитой от коллизий `(1)`.
 - `ytdlp.go` — subprocess yt-dlp, прогресс-парсер, stall-детект (20 с без прогресса → kill+retry), распаковка из embed, kill-tree, `probeEngine()` (версия движка, кэш, вызывается из main и `/api/engine`). Плейлисты: `--flat-playlist --playlist-items 1-500`, таймаут 90 с. `--ignore-config` во всех трёх вызовах.
 - `netprobe.go` — `probeReach` (DNS + TCP:443), `probeReachAsync` (гонка с `/api/info`), `waitReach`, `envProxySet`. Вердикты: `ok` / `dns` / `tcp` / `proxy` / `unknown`.
-- `embedded/*.gz` — gzip-архивы yt-dlp.exe и ffmpeg.exe, вшиты через `//go:embed`. Распаковка в `%LOCALAPPDATA%\clipnip\bin\` при первом запуске (ensureBins). yt-dlp перезаписывается, только если константа `ytdlpVersion` не совпадает с маркером `yt-dlp.exe.ver`; ffmpeg не перезаписывается никогда (ручное обновление). Склейка видео+аудио идёт через `--ffmpeg-location` на binDir — ffmpeg в PATH не нужен.
+- `embedded/*.gz` — gzip-архивы yt-dlp.exe, ffmpeg.exe и deno.exe, вшиты через `//go:embed`. Распаковка в `%LOCALAPPDATA%\clipnip\bin\` при первом запуске (ensureBins). yt-dlp и deno перезаписываются, только если их версия в константах `ytdlpVersion`/`denoVersion` не совпадает с маркером `*.ver`; ffmpeg не перезаписывается никогда (ручное обновление). Склейка видео+аудио идёт через `--ffmpeg-location` на binDir — ffmpeg в PATH не нужен.
+- `jsRuntimeArgs(dir)` — `--js-runtimes deno:<binDir>`; deno нужен для yt-dlp-ejs. **Проверено:** без него JS-рантайма на машине нет вообще (node/bun/quickjs отсутствуют), и при этом yt-dlp и так находит deno рядом со своим exe — флаг держим как страховку, а не как необходимое условие.
 
 ## Обновление вшитых бинарников
 
-1. Скачать свежие `yt-dlp.exe` и `ffmpeg.exe` (GitHub / gyan.dev). Только стабильный релиз: ассеты nightly удаляются через неделю, монобинарник их не переживёт.
-2. Запаковать в `embedded/` (имена: `yt-dlp.exe.gz`, `ffmpeg.exe.gz`). `gzip` в PowerShell нет — пакуй любым gzip-инструментом (git bash, 7-Zip, python `gzip`).
-3. **Поднять константу `ytdlpVersion` в `ytdlp.go`** под новую версию `yt-dlp --version`. Без этого бинарник не переедет к уже установленному приложению.
+1. Скачать свежие `yt-dlp.exe`, `ffmpeg.exe` (GitHub / gyan.dev) и `deno.exe` (релиз denoland/deno, ассет `deno-x86_64-pc-windows-msvc.zip`). Только стабильный релиз: ассеты nightly удаляются, монобинарник их не переживёт.
+2. Запаковать в `embedded/` (имена: `yt-dlp.exe.gz`, `ffmpeg.exe.gz`, `deno.exe.gz`). `gzip` в PowerShell нет — пакуй любым gzip-инструментом (git bash, 7-Zip, python `gzip`). deno.exe уже упакован: gzip даёт 42.6 MB из 97.5 MB, экономить не на чем.
+3. **Поднять константы `ytdlpVersion` и `denoVersion` в `ytdlp.go`** под новые версии. Без этого бинарники не переедут к уже установленному приложению.
 4. Пересобрать exe. ffmpeg обновлять не обязательно (yt-dlp обновляется чаще).
 
 ## Do NOT touch
@@ -72,6 +73,9 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
 15. **Сбой чтения cookies у yt-dlp роняет ВЕСЬ процесс.** На ошибке расшифровки DPAPI yt-dlp поднимает `DownloadError` с комментарием «force exit» — не просто «не прочитал cookies», а полный отказ. Включённые cookies способны сломать скачивание вообще всего, включая обычный YouTube. Отсюда обязательная кнопка Test и человеческий перевод сбоев (занятая база — issue 7271, DPAPI — issue 10927).
 16. **Любой Chromium-форк читается через `chromium:<каталог-профиля>`** — спецификация yt-dlp принимает путь вместо имени. Не нужно перечислять Yandex.Browser и прочие: точечно указываем путь к профилю (не к `User Data` — `Local State` ищется уровнем выше).
 17. **Тесты не должны писать в рантайм-каталоги.** `configDirOverride` + `TestMain` уводят конфиг в temp; без этого юнит-тест на cookies затирает `download_dir` пользователя (уже случалось).
+18. **`--no-playlist` больше не передаётся в `/api/info`** — yt-dlp сам различает одно видео и страницу с несколькими. Возврат флага тихо урежет не-YouTube страницу с несколькими роликами до одного. `--flat-playlist` — только для ссылок на плейлист YouTube.
+19. **Форматы: при равной высоте https-DASH предпочтительнее m3u8.** Наивный max tbr отдавал HLS (битрейт всегда выше), а у HLS `total_bytes` иногда NA — прогресс-бар терял точность.
+20. **deno не сжимается.** gzip даёт 42.6 MB из 97.5 MB, поэтому вшивание стоит ~42 MB и не имеет альтернативы: node/bun/quickjs на машине отсутствуют.
 
 ## Места хранения
 
