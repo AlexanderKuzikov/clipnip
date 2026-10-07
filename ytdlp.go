@@ -22,6 +22,11 @@ import (
 const (
 	ytdlpGz  = "embedded/yt-dlp.exe.gz"
 	ffmpegGz = "embedded/ffmpeg.exe.gz"
+
+	// ytdlpVersion — версия вшитого yt-dlp. Сверяется с маркером рядом с
+	// распакованным бинарником: смена версии в embed принудительно
+	// перераспаковывает файл (extractEmbedded иначе не перезаписывает).
+	ytdlpVersion = "2026.08.19"
 )
 
 type progressState struct {
@@ -45,24 +50,40 @@ func binDir() (string, error) {
 }
 
 // ensureBins распаковывает yt-dlp и ffmpeg из embed при первом запуске.
-// Существующие файлы на диске не перезаписываются (ручное обновление возможно).
 func ensureBins() error {
 	dir, err := binDir()
 	if err != nil {
 		return err
 	}
-	if err := extractEmbedded(dir, ytdlpGz, "yt-dlp.exe"); err != nil {
+	if err := extractEmbedded(dir, ytdlpGz, "yt-dlp.exe", ytdlpVersion); err != nil {
 		return fmt.Errorf("yt-dlp extract: %w", err)
 	}
-	if err := extractEmbedded(dir, ffmpegGz, "ffmpeg.exe"); err != nil {
+	if err := extractEmbedded(dir, ffmpegGz, "ffmpeg.exe", ""); err != nil {
 		return fmt.Errorf("ffmpeg extract: %w", err)
 	}
 	return nil
 }
 
-func extractEmbedded(dir, gzPath, destName string) error {
+// ffmpegPath — путь к распакованному ffmpeg, "" если его нет.
+func ffmpegPath(dir string) string {
+	p := filepath.Join(dir, "ffmpeg.exe")
+	if _, err := os.Stat(p); err != nil {
+		return ""
+	}
+	return p
+}
+
+func extractEmbedded(dir, gzPath, destName, version string) error {
 	dest := filepath.Join(dir, destName)
-	if _, err := os.Stat(dest); err == nil {
+	marker := dest + ".ver"
+
+	if version != "" {
+		if cur, err := os.ReadFile(marker); err == nil && string(cur) == version {
+			if _, err := os.Stat(dest); err == nil {
+				return nil
+			}
+		}
+	} else if _, err := os.Stat(dest); err == nil {
 		return nil
 	}
 
@@ -89,7 +110,13 @@ func extractEmbedded(dir, gzPath, destName string) error {
 		os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, dest)
+	if err := os.Rename(tmp, dest); err != nil {
+		return err
+	}
+	if version != "" {
+		os.WriteFile(marker, []byte(version), 0o644)
+	}
+	return nil
 }
 
 var errStripRe = regexp.MustCompile(`(?m)^ERROR:\s*`)
@@ -114,6 +141,11 @@ func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 		"--newline",
 		"--progress-template", progressTemplate,
 	}, args...)
+
+	// склейка видео+аудио идёт через ffmpeg из binDir, а не из PATH
+	if ff := ffmpegPath(dir); ff != "" {
+		args = append([]string{"--ffmpeg-location", ff}, args...)
+	}
 
 	cmd := exec.Command(ytdlp, args...)
 	cmd.Env = append(os.Environ(), "PYTHONIOENCODING=utf-8")

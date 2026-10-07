@@ -26,14 +26,14 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
 - `config.go` — конфиг в `%LOCALAPPDATA%\clipnip\config.json`; папка загрузки хранится там.
 - `jobs.go` — джобы в памяти, адаптивная параллельность (старт 8, потолок 10, пол 1; +1 за 15 успешных; ÷2 при сетевой ошибке; cooldown 30 с при 429 / 15 с при 403 блокирует все новые старты), очередь 1024 + приоритетная retryQueue; сетевой отказ → requeue с backoff 5с×N (до 2 повторов, потолок суммарно 90 с); watchdog 60 с без роста байтов → kill + error; кнопка Retry только для фатальных; чистка `.part` старше 24 ч; пропуск уже скачанных: перед стартом yt-dlp проверка `title` + расширение режима в папке загрузки → статус `skipped` (обход — флаг `force` в /api/download, «Download anyway»); имя файла — title из /api/info (фолбэк: fetchTitle, 15 c), переименование с защитой от коллизий `(1)`.
 - `ytdlp.go` — subprocess yt-dlp, прогресс-парсер, stall-детект (20 с без прогресса → kill+retry), распаковка из embed, kill-tree. Плейлисты: `--flat-playlist --playlist-items 1-500`, таймаут 90 с.
-- `embedded/*.gz` — gzip-архивы yt-dlp.exe и ffmpeg.exe, вшиты через `//go:embed`. Распаковка в `%LOCALAPPDATA%\clipnip\bin\` при первом запуске (ensureBins). Существующие файлы на диске не перезаписываются.
+- `embedded/*.gz` — gzip-архивы yt-dlp.exe и ffmpeg.exe, вшиты через `//go:embed`. Распаковка в `%LOCALAPPDATA%\clipnip\bin\` при первом запуске (ensureBins). yt-dlp перезаписывается, только если константа `ytdlpVersion` не совпадает с маркером `yt-dlp.exe.ver`; ffmpeg не перезаписывается никогда (ручное обновление). Склейка видео+аудио идёт через `--ffmpeg-location` на binDir — ffmpeg в PATH не нужен.
 
 ## Обновление вшитых бинарников
 
-1. Скачать свежие `yt-dlp.exe` и `ffmpeg.exe` (GitHub / gyan.dev).
-2. Gzip их в `embedded/` (имена: `yt-dlp.exe.gz`, `ffmpeg.exe.gz`), например:
-   `gzip -k yt-dlp.exe && mv yt-dlp.exe.gz embedded/`
-3. Пересобрать exe. ffmpeg обновлять не обязательно (yt-dlp обновляется чаще).
+1. Скачать свежие `yt-dlp.exe` и `ffmpeg.exe` (GitHub / gyan.dev). Только стабильный релиз: ассеты nightly удаляются через неделю, монобинарник их не переживёт.
+2. Запаковать в `embedded/` (имена: `yt-dlp.exe.gz`, `ffmpeg.exe.gz`). `gzip` в PowerShell нет — пакуй любым gzip-инструментом (git bash, 7-Zip, python `gzip`).
+3. **Поднять константу `ytdlpVersion` в `ytdlp.go`** под новую версию `yt-dlp --version`. Без этого бинарник не переедет к уже установленному приложению.
+4. Пересобрать exe. ffmpeg обновлять не обязательно (yt-dlp обновляется чаще).
 
 ## Do NOT touch
 
@@ -57,6 +57,7 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
 7. **`--print` без модификатора WHEN подразумевает `--simulate`** — yt-dlp НЕ скачает. И `--print after_move:title` ТОЖЕ глушит прогресс-вывод (проверено) — имя брать из `/api/info` или тихим `yt-dlp --print title URL` до скачивания.
 8. **UI: без КАПС** — `text-transform: none`; тексты в обычном регистре (требование пользователя).
 9. **Бинарники вшиты (офлайн)**: никаких скачиваний в рантайме — GitHub/gyan.dev блокируются в РФ. Обновление — только пересборкой.
+10. **Отставший yt-dlp ломает скачивание, а не только метаданные.** 2026.07.04 отдавал рабочий extractor и `403 Forbidden` на сам видеопоток (клиент `android_vr` отключён). Логи выглядят как «сеть виновата» — ретраи и cooldown такое не лечат. Проверять версию первым делом.
 
 ## Места хранения
 
