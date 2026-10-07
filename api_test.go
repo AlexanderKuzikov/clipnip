@@ -26,6 +26,57 @@ func TestFontsServe(t *testing.T) {
 	}
 }
 
+// Проба транспорта не должна путать сетевой блок с отказом сайта:
+// домен, который резолвится и слушает 443, — это «сеть в порядке», даже если
+// сам сайт потом отдаст 403.
+func TestProbeReachLive(t *testing.T) {
+	reach := probeReach("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+	if reach.Verdict != reachOK {
+		t.Fatalf("youtube must be reachable here, got %q (%s)", reach.Verdict, reach.Detail)
+	}
+}
+
+func TestProbeReachRejectsGarbage(t *testing.T) {
+	for _, raw := range []string{"", "not-a-url", "://", "https://"} {
+		if got := probeReach(raw); got.Verdict != reachUnknown {
+			t.Errorf("probeReach(%q) = %q, want %q", raw, got.Verdict, reachUnknown)
+		}
+	}
+}
+
+func TestProbeReachRespectsProxyEnv(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+	if got := probeReach("https://www.youtube.com/"); got.Verdict != reachProxy {
+		t.Fatalf("with proxy set must not claim reachability, got %q", got.Verdict)
+	}
+}
+
+func TestReachDetailsAreDistinct(t *testing.T) {
+	seen := map[string]bool{}
+	for _, v := range []string{reachOK, reachDNS, reachTCP, reachProxy, reachUnknown} {
+		d := reachDetail(v)
+		if d == "" {
+			t.Errorf("%s needs a human detail", v)
+		}
+		if seen[d] {
+			t.Errorf("%s duplicates another verdict detail", v)
+		}
+		seen[d] = true
+	}
+}
+
+func TestWaitReachDoesNotBlockForever(t *testing.T) {
+	ch := make(chan reachResult) // ничего не шлём
+	start := time.Now()
+	got := waitReach(ch, 150*time.Millisecond)
+	if got.Verdict != reachUnknown {
+		t.Errorf("want unknown on timeout, got %q", got.Verdict)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("waitReach blocked too long: %s", elapsed)
+	}
+}
+
 func TestPlaylistDetection(t *testing.T) {
 	cases := map[string]bool{
 		"https://www.youtube.com/playlist?list=PL7I7TsNvvxnN95A4teM8_Qn4-dbB0mz3l": true,
@@ -65,25 +116,105 @@ func TestPlaylistEntries(t *testing.T) {
 
 func TestClassifyError(t *testing.T) {
 	cases := map[string]string{
-		"HTTP Error 429: Too Many Requests":                       "429",
-		"HTTP Error 403: Forbidden":                               "403",
-		"Requested format is not available":                        "fatal",
-		"Video unavailable":                                        "fatal",
-		"This video is not available":                              "fatal",
-		"This video is private":                                    "fatal",
-		"Private video":                                            "fatal",
-		"Unsupported URL: ftp://x":                                 "fatal",
-		"[generic] timed out":                                      "network",
-		"stalled: no progress":                                     "network",
-		"Read timed out after 15000ms":                             "network",
-		"HTTP Error 503: Service Unavailable":                      "network",
-		"Video unavailable in your country":                        "fatal",
-		"HTTP Error 404: Not Found":                                "fatal",
+		// троттлинг
+		"HTTP Error 429: Too Many Requests": "throttle",
+		"[youtube] Video: Too Many Requests": "throttle",
+		// отказ отдачи: extractor отработал (в логе виден выбор форматов),
+		// но видеопоток не отдали — это устаревший движок, а не перегрузка
+		"unable to download video data: HTTP Error 403: Forbidden": "engine",
+		"unable to download api page: HTTP Error 403: Forbidden":  "engine",
+		// отказ сайта: нужен бот-чек/cookies
+		"HTTP Error 403: Forbidden": "site",
+		"Sign in to confirm you're not a bot. Use --cookies-from-browser": "site",
+		"Sign in to confirm you’re not a bot": "site",
+		"This video is age-restricted": "site",
+		// фатальные
+		"Requested format is not available": "fatal",
+		"Video unavailable":                 "fatal",
+		"This video is not available":        "fatal",
+		"This video is private":             "fatal",
+		"Private video":                     "fatal",
+		"Unsupported URL: ftp://x":          "fatal",
+		"Video unavailable in your country": "fatal",
+		"HTTP Error 404: Not Found":         "fatal",
+		// сеть
+		"[generic] timed out":          "network",
+		"stalled: no progress":         "network",
+		"Read timed out after 15000ms": "network",
+		"HTTP Error 503: Service Unavailable": "network",
 	}
 	for msg, want := range cases {
 		if got := classifyError(msg); got != want {
 			t.Errorf("classifyError(%q) = %q, want %q", msg, got, want)
 		}
+	}
+}
+
+// Ключевая инварианта фазы диагностики: отказ сайта и отказ отдачи НЕ трогают
+// пул параллельности. Раньше 403 попадал в тот же класс, что и 429, из-за чего
+// приложение само себя душило на сломанном движке.
+func TestFailureClassesAffectParallelism(t *testing.T) {
+	affects := []string{errThrottle, errNetwork}
+	touches := []string{errSite, errEngine, errFatal}
+	for _, k := range affects {
+		if !affectsParallelism(k) {
+			t.Errorf("%s must affect parallelism", k)
+		}
+		if !retriable(k) {
+			t.Errorf("%s must be retriable", k)
+		}
+	}
+	for _, k := range touches {
+		if affectsParallelism(k) {
+			t.Errorf("%s must NOT affect parallelism", k)
+		}
+	}
+	if retriable(errEngine) {
+		t.Error("stale engine is not fixed by retrying")
+	}
+	if retriable(errFatal) {
+		t.Error("fatal is not fixed by retrying")
+	}
+}
+
+// Адаптивная параллельность не должна деградировать от отказа сайта:
+// раньше именно это маскировало поломку движка под «перегрузку YouTube».
+func TestSiteRefusalKeepsPool(t *testing.T) {
+	adapt.Lock()
+	adapt.current = startParallel
+	adapt.successes = 0
+	adapt.cooldownUntil = time.Time{}
+	adapt.Unlock()
+
+	if affectsParallelism(classifyError("HTTP Error 403: Forbidden")) {
+		t.Fatal("403 from site must not reach adaptFailure")
+	}
+
+	// троттлинг — наоборот, должен резать и брать cooldown
+	adaptFailure(classifyError("HTTP Error 429: Too Many Requests"))
+	if adapt.current != startParallel/2 {
+		t.Fatalf("throttle must halve pool: got %d", adapt.current)
+	}
+	if time.Now().After(adapt.cooldownUntil) {
+		t.Fatal("throttle must set cooldown")
+	}
+
+	adapt.Lock()
+	adapt.current = startParallel
+	adapt.successes = 0
+	adapt.cooldownUntil = time.Time{}
+	adapt.Unlock()
+}
+
+func TestErrorHint(t *testing.T) {
+	if errorHint(errEngine) == "" {
+		t.Error("stale engine needs a hint pointing at the rebuild")
+	}
+	if errorHint(errSite) == "" {
+		t.Error("site refusal needs a hint pointing at cookies")
+	}
+	if h := errorHint(errNetwork); h != "" {
+		t.Errorf("network errors need no hint, got %q", h)
 	}
 }
 
@@ -131,7 +262,7 @@ func TestAdaptiveParallel(t *testing.T) {
 	adapt.Unlock()
 
 	// серия сетевых отказов: 8 -> 4 -> 2 -> 1 -> пол 1
-	adaptFailure("network")
+	adaptFailure(errNetwork)
 	if adapt.current != 4 {
 		t.Fatalf("after 1 failure want 4, got %d", adapt.current)
 	}
@@ -139,22 +270,22 @@ func TestAdaptiveParallel(t *testing.T) {
 	if adapt.current != 2 {
 		t.Fatalf("after 2 failures want 2, got %d", adapt.current)
 	}
-	adaptFailure("network")
+	adaptFailure(errNetwork)
 	if adapt.current != 1 {
 		t.Fatalf("after 3 failures want 1, got %d", adapt.current)
 	}
-	adaptFailure("network")
+	adaptFailure(errNetwork)
 	if adapt.current != 1 {
 		t.Fatalf("floor must be 1, got %d", adapt.current)
 	}
 
-	// 429: ещё и cooldown
-	adaptFailure("429")
+	// троттлинг: держит пол и добавляет cooldown
+	adaptFailure(errThrottle)
 	if adapt.current != 1 {
-		t.Fatalf("429 keeps floor, got %d", adapt.current)
+		t.Fatalf("throttle keeps floor, got %d", adapt.current)
 	}
 	if time.Now().After(adapt.cooldownUntil) {
-		t.Fatal("429 must set cooldownUntil in the future")
+		t.Fatal("throttle must set cooldownUntil in the future")
 	}
 
 	// рост: successStep успешных подряд -> +1

@@ -29,6 +29,16 @@ func main() {
 		fatalBox(err)
 		return
 	}
+	if version, hasFFmpeg := probeEngine(); version != "" {
+		if version != ytdlpVersion {
+			log.Printf("engine: yt-dlp %s (embedded %s, differs)", version, ytdlpVersion)
+		} else {
+			log.Printf("engine: yt-dlp %s", version)
+		}
+		if !hasFFmpeg {
+			log.Printf("engine: ffmpeg missing — merging video+audio will fail")
+		}
+	}
 
 	if !headless() && !webView2Installed() {
 		log.Printf("WebView2 Runtime not found")

@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -47,6 +48,39 @@ func binDir() (string, error) {
 		return "", err
 	}
 	return dir, nil
+}
+
+// engineInfo — версия и путь распакованного движка. Показывается в UI,
+// потому что главный источник «всё сломалось» — устаревший yt-dlp, а не сеть.
+var engineInfo = struct {
+	sync.Mutex
+	version string
+	ffmpeg  bool
+	done    bool
+}{}
+
+// probeEngine один раз спрашивает версию у движка (~1.5 с), результат кэшируется.
+func probeEngine() (string, bool) {
+	engineInfo.Lock()
+	defer engineInfo.Unlock()
+	if engineInfo.done {
+		return engineInfo.version, engineInfo.ffmpeg
+	}
+	engineInfo.done = true
+
+	dir, err := binDir()
+	if err == nil {
+		cmd := exec.Command(filepath.Join(dir, "yt-dlp.exe"), "--version")
+		cmd.Env = append(os.Environ(), "PYTHONIOENCODING=utf-8")
+		cmd.SysProcAttr = noWindow()
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		if cmd.Run() == nil {
+			engineInfo.version = strings.TrimSpace(out.String())
+		}
+		engineInfo.ffmpeg = ffmpegPath(dir) != ""
+	}
+	return engineInfo.version, engineInfo.ffmpeg
 }
 
 // ensureBins распаковывает yt-dlp и ffmpeg из embed при первом запуске.
@@ -139,6 +173,9 @@ func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 	args = append([]string{
 		"--no-warnings",
 		"--newline",
+		// пользовательский %APPDATA%\yt-dlp\config может подсунуть свои
+		// --output/--proxy/--cookies и сломать или перехватить поведение
+		"--ignore-config",
 		"--progress-template", progressTemplate,
 	}, args...)
 
@@ -270,7 +307,7 @@ func infoJSON(url string, playlist bool) (map[string]any, error) {
 	}
 	ytdlp := filepath.Join(dir, "yt-dlp.exe")
 
-	args := []string{"--no-warnings", "--dump-single-json"}
+	args := []string{"--no-warnings", "--ignore-config", "--dump-single-json"}
 	if playlist {
 		// плейлист: берём первые 500 записей, таймаут шире
 		args = append(args, "--flat-playlist", "--playlist-items", "1-500")
@@ -330,7 +367,7 @@ func fetchTitle(url string) (string, error) {
 	}
 	ytdlp := filepath.Join(dir, "yt-dlp.exe")
 
-	cmd := exec.Command(ytdlp, "--no-warnings", "--no-playlist", "--print", "title", url)
+	cmd := exec.Command(ytdlp, "--no-warnings", "--ignore-config", "--no-playlist", "--print", "title", url)
 	cmd.Env = append(os.Environ(), "PYTHONIOENCODING=utf-8")
 	cmd.SysProcAttr = noWindow()
 

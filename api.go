@@ -98,6 +98,35 @@ func newAPI() http.Handler {
 		w.Write(data)
 	})
 
+	mux.HandleFunc("/api/engine", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
+			return
+		}
+		version, hasFFmpeg := probeEngine()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"version": version,
+			"embedded": ytdlpVersion,
+			"stale":   version != "" && version != ytdlpVersion,
+			"ffmpeg":  hasFFmpeg,
+		})
+	})
+
+	mux.HandleFunc("/api/reach", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
+			return
+		}
+		var req struct{ URL string `json:"url"` }
+		json.NewDecoder(r.Body).Decode(&req)
+		u := strings.TrimSpace(req.URL)
+		if !isAllowedURL(u) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Only http/https URLs are allowed"})
+			return
+		}
+		writeJSON(w, http.StatusOK, probeReach(u))
+	})
+
 	mux.HandleFunc("/api/settings", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
@@ -170,10 +199,18 @@ func newAPI() http.Handler {
 		}
 
 		isPlaylist := isPlaylistURL(u)
+		// Проба сети идёт параллельно извлечению метаданных: на заблокированном
+		// домене yt-dlp будет висеть до 45 с, а вердикт пробы готов за секунды.
+		reachCh := probeReachAsync(u)
 		info, err := infoJSON(u, isPlaylist)
 		if err != nil {
-			log.Printf("info failed url=%s: %v", u, err)
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			reach := waitReach(reachCh, 6*time.Second)
+			log.Printf("info failed url=%s reach=%s: %v", u, reach.Verdict, err)
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error":         err.Error(),
+				"reach":         reach.Verdict,
+				"reach_detail":  reach.Detail,
+			})
 			return
 		}
 

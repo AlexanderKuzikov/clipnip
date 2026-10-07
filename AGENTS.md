@@ -23,9 +23,13 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
   - `POST /api/download` — очередь (дедуп sha1 url|mode|format_id)
   - `GET /api/status/<id>`; `POST /api/cancel/<id>`; `GET /api/open/<id>`; `GET /api/file/<id>`
   - `GET/POST /api/settings` — папка загрузки (`download_dir` или `browse`: нативный диалог SHBrowseForFolderW)
+  - `POST /api/engine` — версия движка, наличие ffmpeg, флаг `stale`
+  - `POST /api/reach` — вердикт транспортной доступности домена
+  - При ошибке `/api/info` отдаёт `reach` + `reach_detail` (UI показывает их важнее текста yt-dlp)
 - `config.go` — конфиг в `%LOCALAPPDATA%\clipnip\config.json`; папка загрузки хранится там.
-- `jobs.go` — джобы в памяти, адаптивная параллельность (старт 8, потолок 10, пол 1; +1 за 15 успешных; ÷2 при сетевой ошибке; cooldown 30 с при 429 / 15 с при 403 блокирует все новые старты), очередь 1024 + приоритетная retryQueue; сетевой отказ → requeue с backoff 5с×N (до 2 повторов, потолок суммарно 90 с); watchdog 60 с без роста байтов → kill + error; кнопка Retry только для фатальных; чистка `.part` старше 24 ч; пропуск уже скачанных: перед стартом yt-dlp проверка `title` + расширение режима в папке загрузки → статус `skipped` (обход — флаг `force` в /api/download, «Download anyway»); имя файла — title из /api/info (фолбэк: fetchTitle, 15 c), переименование с защитой от коллизий `(1)`.
-- `ytdlp.go` — subprocess yt-dlp, прогресс-парсер, stall-детект (20 с без прогресса → kill+retry), распаковка из embed, kill-tree. Плейлисты: `--flat-playlist --playlist-items 1-500`, таймаут 90 с.
+- `jobs.go` — джобы в памяти; **таксономия ошибок 5 классов** (`classifyError`): `throttle` / `engine` (extractor отработал, поток не отдали → движок устарел) / `site` (отказ сайта: бот-чек, нет авторизации) / `fatal` / `network`. `affectsParallelism` — только throttle+network режут пул и берут cooldown (30 с при 429); `retriable` — кроме engine и fatal; `errorHint` → actionable-текст в UI. Адаптивная параллельность (старт 8, потолок 10, пол 1; +1 за 15 успешных; ÷2 при throttle/network), очередь 1024 + приоритетная retryQueue; сетевой отказ → requeue с backoff 5с×N (до 2 повторов, потолок суммарно 90 с); watchdog 60 с без роста байтов → kill + error; кнопка Retry только для фатальных; чистка `.part` старше 24 ч; пропуск уже скачанных: перед стартом yt-dlp проверка `title` + расширение режима в папке загрузки → статус `skipped` (обход — флаг `force` в /api/download, «Download anyway»); имя файла — title из /api/info (фолбэк: fetchTitle, 15 c), переименование с защитой от коллизий `(1)`.
+- `ytdlp.go` — subprocess yt-dlp, прогресс-парсер, stall-детект (20 с без прогресса → kill+retry), распаковка из embed, kill-tree, `probeEngine()` (версия движка, кэш, вызывается из main и `/api/engine`). Плейлисты: `--flat-playlist --playlist-items 1-500`, таймаут 90 с. `--ignore-config` во всех трёх вызовах.
+- `netprobe.go` — `probeReach` (DNS + TCP:443), `probeReachAsync` (гонка с `/api/info`), `waitReach`, `envProxySet`. Вердикты: `ok` / `dns` / `tcp` / `proxy` / `unknown`.
 - `embedded/*.gz` — gzip-архивы yt-dlp.exe и ffmpeg.exe, вшиты через `//go:embed`. Распаковка в `%LOCALAPPDATA%\clipnip\bin\` при первом запуске (ensureBins). yt-dlp перезаписывается, только если константа `ytdlpVersion` не совпадает с маркером `yt-dlp.exe.ver`; ffmpeg не перезаписывается никогда (ручное обновление). Склейка видео+аудио идёт через `--ffmpeg-location` на binDir — ffmpeg в PATH не нужен.
 
 ## Обновление вшитых бинарников
@@ -58,6 +62,10 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
 8. **UI: без КАПС** — `text-transform: none`; тексты в обычном регистре (требование пользователя).
 9. **Бинарники вшиты (офлайн)**: никаких скачиваний в рантайме — GitHub/gyan.dev блокируются в РФ. Обновление — только пересборкой.
 10. **Отставший yt-dlp ломает скачивание, а не только метаданные.** 2026.07.04 отдавал рабочий extractor и `403 Forbidden` на сам видеопоток (клиент `android_vr` отключён). Логи выглядят как «сеть виновата» — ретраи и cooldown такое не лечат. Проверять версию первым делом.
+11. **403 ≠ перегрузка.** Проверено на живом X: `GET https://x.com/` из пустого профиля браузера даёт HTTP 403 при полностью рабочей сети — это отказ сайта небраузерному клиенту, а не блокировка. Раньше ClipNip классифицировал любой 403 как троттлинг, резал пул параллельности до 1 и так маскировал сломанный движок. Проверку сети (`netprobe.go`) никогда не строи на HTTP-статусе — только DNS и TCP.
+12. **`unable to download video data` — маркер устаревшего движка.** Эта строка бывает только в загрузчике, то есть extractor уже вернул форматы; ловится первой строкой в `classifyError`, до проверок на 403.
+13. **Пользовательский `%APPDATA%\yt-dlp\config` может всё сломать** (свой `--output`, `--proxy`, `--cookies`) — поэтому `--ignore-config` во всех вызовах.
+14. **Прямой доступ к YouTube и части сайтов закрыт по сети РФ**, нужен VPN. ClipNip наследует маршрут системы; если в окружении задан `HTTP(S)_PROXY`/`ALL_PROXY`, проба сети обязана молчать, а не гадать по прямому TCP.
 
 ## Места хранения
 

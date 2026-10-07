@@ -37,6 +37,11 @@ type Job struct {
 	Speed      int64
 	ETA        int64
 
+	// ErrorHint — короткая подсказка «что делать» по классу ошибки.
+	// Держим отдельно от Error (сырой текст yt-dlp), чтобы UI мог показать
+	// actionable-сообщение, не разбирая чужую строку в браузере.
+	ErrorHint string
+
 	Retries       int       // сетевые повторы (requeue)
 	NextRetryAt   time.Time // когда retry_wait → queued
 	FirstRetryAt  time.Time // начало цепочки ретраев (для потолка retryTotalTimeout)
@@ -109,6 +114,7 @@ func (j *Job) snapshot() map[string]any {
 		"progress":         j.Progress,
 		"resumed":          j.Resumed,
 		"error":            j.Error,
+		"error_hint":       j.ErrorHint,
 		"filename":         j.Filename,
 		"downloaded_human": humanBytes(j.Downloaded),
 		"total_human":      humanBytes(j.Total),
@@ -142,7 +148,6 @@ const (
 	successStep    = 15 // +1 за N успешных подряд
 	failDivisor    = 2  // ÷N при сетевом отказе
 	cooldown429    = 30 * time.Second
-	cooldown403    = 15 * time.Second
 	maxRetries     = 2            // повторов после сетевого отказа, дальше — error
 	retryBaseDelay = 5 * time.Second // backoff: 5с, 10с...
 	stuckTimeout   = 60 * time.Second // watchdog: нет роста байтов дольше stuckTimeout → джоб «завис»
@@ -236,10 +241,8 @@ func adaptFailure(kind string) {
 		}
 	}
 	switch kind {
-	case "429":
+	case errThrottle:
 		adapt.cooldownUntil = time.Now().Add(cooldown429)
-	case "403":
-		adapt.cooldownUntil = time.Now().Add(cooldown403)
 	}
 	log.Printf("parallel: -> %d (failure: %s)", adapt.current, kind)
 	adapt.cond.Broadcast()
@@ -479,22 +482,70 @@ func buildDownloadArgs(job *Job) []string {
 	return base
 }
 
-var fatalErrRe = regexp.MustCompile(`(?i)unsupported url|private video|this video is private|video unavailable|this video is not available|not available in your country|unavailable in your country|has been removed|copyright|requested format is not available|http error 404|invalid url|sign in to confirm|age-restricted`)
+var fatalErrRe = regexp.MustCompile(`(?i)unsupported url|private video|this video is private|video unavailable|this video is not available|not available in your country|unavailable in your country|has been removed|copyright|requested format is not available|http error 404|invalid url`)
 
-// classifyError: "fatal" — ретраить бессмысленно; "429"/"403" — перегрузка (cooldown);
-// "network" — временный сбой (в т.ч. ложный «Video unavailable» при блокировках).
+// Классы ошибок. Различать важно, потому что лечатся они противоположно:
+// только троттлинг и сеть лечатся ожиданием и снижением параллельности,
+// а отказ сайта и отказ отдачи — конфигурацией (cookies) и обновлением движка.
+const (
+	errThrottle = "throttle" // 429 — превышен лимит, ждать и резать параллельность
+	errEngine   = "engine"   // extractor отработал, но поток данных не отдали → движок устарел
+	errSite     = "site"     // сайт отказал: бот-чек, нет авторизации, 403 на этапе extractor
+	errFatal    = "fatal"    // ролика не существует/недоступен, ретрай бессмыслен
+	errNetwork  = "network"  // таймаут, обрыв, 5xx
+)
+
+// classifyError раскладывает ошибку yt-dlp по классу.
+//
+// Отказ медиапотока ловится раньше всего: строка "unable to download video data"
+// появляется только в загрузчике, то есть extractor уже вернул форматы. Любой
+// другой 403 — это отказ сайта, и ретраить его бессмысленно, а снижать
+// параллельность — вредно: так уже маскировал баг с устаревшим движком.
 func classifyError(msg string) string {
 	lower := strings.ToLower(msg)
 	switch {
-	case strings.Contains(lower, "429") || strings.Contains(lower, "too many requests"):
-		return "429"
-	case strings.Contains(lower, "http error 403"):
-		return "403"
+	case strings.Contains(lower, "unable to download video data"),
+		strings.Contains(lower, "unable to download api page"):
+		return errEngine
+	case strings.Contains(lower, "429"), strings.Contains(lower, "too many requests"):
+		return errThrottle
+	case strings.Contains(lower, "sign in to confirm"),
+		strings.Contains(lower, "confirm you're not a bot"),
+		strings.Contains(lower, "confirm you are not a bot"),
+		strings.Contains(lower, "login required"),
+		strings.Contains(lower, "cookies"),
+		strings.Contains(lower, "http error 401"),
+		strings.Contains(lower, "http error 403"),
+		strings.Contains(lower, "age-restricted"):
+		return errSite
 	case fatalErrRe.MatchString(lower):
-		return "fatal"
+		return errFatal
 	default:
-		return "network"
+		return errNetwork
 	}
+}
+
+// retriable: повтор имеет смысл только там, где причина временная.
+func retriable(kind string) bool {
+	return kind == errThrottle || kind == errSite || kind == errNetwork
+}
+
+// affectsParallelism: понижать параллельность и брать cooldown умеет только
+// перегрузка и сеть. Отказ сайта (403 на extractor) — это про cookies,
+// а не про нагрузку; отказ отдачи — про версию движка.
+func affectsParallelism(kind string) bool {
+	return kind == errThrottle || kind == errNetwork
+}
+
+// errorHint — что предложить пользователю по классу ошибки.
+func errorHint(kind string) string {
+	switch kind {
+	case errEngine:
+		return "The embedded yt-dlp is too old for this site and cannot fetch the stream. Rebuild ClipNip to update the engine."
+	case errSite:
+		return "The site refused the request. Enabling cookies in settings usually fixes this (the site wants a logged-in session)."
+	}
+	return ""
 }
 
 func runDownload(job *Job) {
@@ -619,10 +670,14 @@ func runDownload(job *Job) {
 			continue
 		}
 		kind := classifyError(lastErr)
-		if kind == "fatal" {
+		if !retriable(kind) {
 			break
 		}
-		adaptFailure(kind)
+		if affectsParallelism(kind) {
+			adaptFailure(kind)
+		} else {
+			log.Printf("site refused job=%s kind=%s (parallelism untouched): %s", job.JobID, kind, lastErr)
+		}
 
 		job.set(func() { job.Retries++ })
 		job.mu.RLock()
@@ -630,7 +685,6 @@ func runDownload(job *Job) {
 		job.mu.RUnlock()
 
 		if retries > maxRetries {
-			log.Printf("download failed job=%s url=%s after %d retries: %s", job.JobID, job.URL, maxRetries, lastErr)
 			break
 		}
 
@@ -690,12 +744,14 @@ func runDownload(job *Job) {
 	}
 
 	if lastErr != "" {
+		kind := classifyError(lastErr)
 		job.set(func() {
 			job.Status = "error"
 			job.Stage = "error"
 			job.Error = lastErr
+			job.ErrorHint = errorHint(kind)
 		})
-		log.Printf("download failed job=%s url=%s: %s", job.JobID, job.URL, lastErr)
+		log.Printf("download failed job=%s url=%s kind=%s: %s", job.JobID, job.URL, kind, lastErr)
 		return
 	}
 

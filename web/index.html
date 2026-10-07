@@ -620,6 +620,11 @@
       text-transform: none;
     }
 
+    .card-hint {
+      color: var(--accent);
+      line-height: 1.45;
+    }
+
     .footer {
       margin-top: 48px;
       text-align: center;
@@ -628,6 +633,10 @@
       letter-spacing: 0.05em;
       text-transform: none;
       line-height: 1.8;
+    }
+
+    .footer.stale {
+      color: var(--error);
     }
 
     @media (max-width: 500px) {
@@ -702,6 +711,10 @@
     </div>
 
     <div id="cards" class="cards"></div>
+
+    <div class="footer" id="engineFooter">
+      <span id="engineLine">checking engine…</span>
+    </div>
   </div>
 
   <script>
@@ -789,6 +802,24 @@
 
     loadDir();
 
+    async function loadEngine() {
+      const line = document.getElementById('engineLine');
+      const foot = document.getElementById('engineFooter');
+      try {
+        const res = await fetch('/api/engine', { method: 'POST', cache: 'no-store' });
+        const d = await res.json();
+        const parts = [`yt-dlp ${d.version || 'unknown'}`];
+        if (!d.ffmpeg) parts.push('ffmpeg missing');
+        if (d.stale) parts.push(`on-disk differs from embedded ${d.embedded}`);
+        line.textContent = parts.join(' · ');
+        foot.classList.toggle('stale', !!d.stale || !d.ffmpeg);
+      } catch {
+        line.textContent = 'engine status unavailable';
+      }
+    }
+
+    loadEngine();
+
     const dirInput = document.getElementById('dirInput');
     dirInput.addEventListener('change', applyDir);
     dirInput.addEventListener('keydown', e => {
@@ -840,10 +871,17 @@
     }
 
     function friendlyError(err = '') {
+      // extractor отработал, но видеопоток не отдали — устаревший движок
+      if (err.includes('unable to download video data')) return 'Engine too old to fetch this stream';
+      if (err.includes('unable to download api page')) return 'Engine too old to fetch this stream';
+      // отказ сайта: нужна сессия
+      if (err.includes('Sign in to confirm')) return 'Site requires a logged-in session';
+      if (err.includes('age-restricted')) return 'This video is age-restricted';
       if (err.includes('Unsupported URL')) return 'This URL is not supported';
       if (err.includes('Video unavailable')) return 'Video is unavailable or private';
       if (err.includes('Private video')) return 'This video is private';
-      if (err.includes('HTTP Error 403')) return 'Access denied by the platform';
+      if (err.includes('HTTP Error 429')) return 'Rate limited by the site — waiting';
+      if (err.includes('HTTP Error 403')) return 'Access denied by the site';
       if (err.includes('HTTP Error 404')) return 'Video not found';
       if (err.includes('copyright')) return 'Video blocked due to copyright';
       if (err.includes('geo')) return 'Video not available in your region';
@@ -939,7 +977,13 @@
           const data = await res.json();
 
           if (!res.ok || data.error) {
-            cardData[idx] = { ...cardData[idx], status: 'info-error', error: data.error || 'Could not fetch video info' };
+            cardData[idx] = {
+              ...cardData[idx],
+              status: 'info-error',
+              error: data.error || 'Could not fetch video info',
+              reach: data.reach || '',
+              reachDetail: data.reach_detail || '',
+            };
           } else if (data.entries && data.entries.length) {
             renderPlaylistHeader(data.playlist_title || '', data.entries.length);
             for (const e of data.entries) {
@@ -1013,6 +1057,9 @@
       }
 
       if (c.status === 'info-error') {
+        // reach_detail важнее текста yt-dlp: он отличает «сеть не пускает»
+        // от «сайт не пускает», а это противоположные действия пользователя.
+        const hint = c.reachDetail && c.reach !== 'ok' ? c.reachDetail : '';
         el.className = 'card card-error';
         el.innerHTML = `
           <div class="card-thumb">
@@ -1026,7 +1073,8 @@
           </div>
           <div class="card-body">
             <div class="card-title" style="color:var(--error)">Could not fetch video</div>
-            <div class="card-error-msg">${esc(friendlyError(c.error || ''))}</div>
+            <div class="card-error-msg">${esc(hint || friendlyError(c.error || ''))}</div>
+            ${hint ? `<div class="card-error-msg">${esc(friendlyError(c.error || ''))}</div>` : ''}
             <div class="card-error-url">${esc(c.url)}</div>
           </div>
         `;
@@ -1089,9 +1137,16 @@
         `;
       }
 
-      const note = c.resumed && (c.status === 'queued' || c.status === 'downloading' || c.status === 'processing')
-        ? `<div class="card-note">Found partial file — continuing previous download</div>`
-        : '';
+      const notes = [];
+      if (c.resumed && (c.status === 'queued' || c.status === 'downloading' || c.status === 'processing')) {
+        notes.push('<div class="card-note">Found partial file — continuing previous download</div>');
+      }
+      // error_hint приходит с бэкенда по классу ошибки: «движок устарел» или
+      // «включи cookies». Это конкретное действие, в отличие от сырого текста.
+      if (c.errorHint && c.status === 'error') {
+        notes.push(`<div class="card-note card-hint">${esc(c.errorHint)}</div>`);
+      }
+      const note = notes.join('');
 
       el.innerHTML = `
         <div class="card-num">#${idx + 1}</div>
@@ -1151,6 +1206,7 @@
       c.requestMode = currentMode;
       c.status = 'queued';
       c.error = null;
+      c.errorHint = null;
       c.progress = 0;
       c.downloadedHuman = null;
       c.totalHuman = null;
@@ -1227,6 +1283,7 @@
         c.etaHuman = data.eta_human || null;
         c.retries = data.retries || 0;
         c.retryIn = data.retry_in || 0;
+        c.errorHint = data.error_hint || '';
         if (c.startedAt && (data.status === 'downloading' || data.status === 'processing')) {
           c.elapsed = fmtElapsed((Date.now() - c.startedAt) / 1000);
         }
