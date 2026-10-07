@@ -538,11 +538,16 @@ func affectsParallelism(kind string) bool {
 }
 
 // errorHint — что предложить пользователю по классу ошибки.
+// Подсказка про cookies бессмысленна, если cookies уже включены: тогда
+// совет «включи cookies» уводит по кругу. Проверено на живом прогоне.
 func errorHint(kind string) string {
 	switch kind {
 	case errEngine:
 		return "The embedded yt-dlp is too old for this site and cannot fetch the stream. Rebuild ClipNip to update the engine."
 	case errSite:
+		if cookiesActive() {
+			return "The site refused the request even with cookies enabled. The session may have expired, the wrong browser profile may be selected, or the site wants different credentials."
+		}
 		return "The site refused the request. Enabling cookies in settings usually fixes this (the site wants a logged-in session)."
 	}
 	return ""

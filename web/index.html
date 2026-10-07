@@ -190,6 +190,125 @@
       margin-bottom: 16px;
     }
 
+    .auth {
+      margin-bottom: 14px;
+      border: 1.5px solid var(--card-border);
+      border-radius: 12px;
+      background: var(--card);
+      padding: 12px 14px;
+    }
+
+    .auth-toggle {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      font-family: 'PT Mono', monospace;
+      font-size: 0.72rem;
+      cursor: pointer;
+      color: var(--fg);
+    }
+
+    .auth-toggle input {
+      width: 15px;
+      height: 15px;
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
+
+    .auth-body {
+      margin-top: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .auth-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .auth select,
+    .auth input {
+      flex: 1;
+      min-width: 180px;
+      padding: 8px 12px;
+      border: 1.5px solid var(--card-border);
+      border-radius: 8px;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: 'PT Mono', monospace;
+      font-size: 0.72rem;
+      outline: none;
+    }
+
+    .auth select:focus,
+    .auth input:focus {
+      border-color: var(--accent);
+    }
+
+    .auth-note {
+      font-size: 0.64rem;
+      color: var(--muted);
+      min-height: 1em;
+      line-height: 1.5;
+    }
+
+    .auth-note.ok {
+      color: var(--success);
+    }
+
+    .auth-note.bad {
+      color: var(--error);
+    }
+
+    .auth-hint {
+      font-size: 0.62rem;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(20, 18, 15, 0.45);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 50;
+      padding: 24px;
+    }
+
+    .modal {
+      background: var(--card);
+      border: 1.5px solid var(--card-border);
+      border-radius: var(--radius);
+      padding: 20px;
+      max-width: 520px;
+      width: 100%;
+    }
+
+    .modal h3 {
+      font-family: 'PT Serif', serif;
+      font-size: 1.15rem;
+      margin-bottom: 10px;
+      font-weight: 400;
+    }
+
+    .modal p {
+      font-size: 0.72rem;
+      line-height: 1.6;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+
+    .modal-actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 16px;
+    }
+
     .mode-btn {
       padding: 12px 14px;
       border: 1.5px solid var(--card-border);
@@ -687,6 +806,35 @@
       <div class="settings-note" id="dirNote"></div>
     </div>
 
+    <div class="auth">
+      <label class="auth-toggle">
+        <input type="checkbox" id="ckEnabled" onchange="onCookiesToggle(this.checked)">
+        <span>Use cookies from my browser</span>
+      </label>
+      <div class="auth-body" id="authBody">
+        <div class="auth-row">
+          <select id="ckBrowser" onchange="onPickBrowser()"></select>
+          <select id="ckProfile" onchange="onPickProfile()"></select>
+        </div>
+        <div class="auth-row">
+          <input id="ckSpec" type="text" spellcheck="false"
+                 placeholder="chrome, edge:Profile 1, chromium:C:\...\Default">
+        </div>
+        <div class="auth-note" id="ckBrowserNote"></div>
+        <div class="auth-row">
+          <input id="ckFile" type="text" spellcheck="false" placeholder="Optional: path to cookies.txt">
+        </div>
+        <div class="auth-actions">
+          <button class="settings-btn" onclick="testCookies()">Test</button>
+          <span class="auth-note" id="ckTestResult"></span>
+        </div>
+        <p class="auth-hint">
+          Sites that require a logged-in session refuse anonymous requests.
+          Any Chromium browser works by pointing the spec at its profile folder.
+        </p>
+      </div>
+    </div>
+
     <div class="mode-grid">
       <button class="mode-btn active" data-mode="video" onclick="setMode(this)">
         <span class="mode-label">Video MP4</span>
@@ -819,6 +967,172 @@
     }
 
     loadEngine();
+
+    let cookieState = { browsers: [], config: {} };
+
+    async function loadCookies() {
+      try {
+        const res = await fetch('/api/cookies', { cache: 'no-store' });
+        const d = await res.json();
+        cookieState = d;
+        renderCookieUI();
+      } catch { /* секция останется неактивной */ }
+    }
+
+    function renderCookieUI() {
+      const cfg = cookieState.config || {};
+      const found = (cookieState.browsers || []).filter(b => b.found);
+      const enabled = !!cfg.enabled;
+
+      document.getElementById('ckEnabled').checked = enabled;
+      document.getElementById('authBody').style.display = enabled ? 'flex' : 'none';
+      document.getElementById('ckSpec').value = cfg.spec || '';
+      document.getElementById('ckFile').value = cfg.file || '';
+
+      const bsel = document.getElementById('ckBrowser');
+      bsel.innerHTML = '<option value="">browser…</option>' + found.map(b =>
+        `<option value="${esc(b.name)}">${esc(b.label)}${b.profiles && b.profiles.length ? '' : ' (no profiles found)'}</option>`
+      ).join('');
+      if (!found.length) {
+        document.getElementById('ckBrowserNote').textContent =
+          'No known browser detected — use the spec field below.';
+      } else if (!cfg.spec) {
+        document.getElementById('ckBrowserNote').textContent = '';
+      } else {
+        document.getElementById('ckBrowserNote').textContent = '';
+      }
+      syncProfileSelect();
+      if (enabled && !cfg.ack) showCookieWarning();
+    }
+
+    function browserByName(name) {
+      return (cookieState.browsers || []).find(b => b.name === name);
+    }
+
+    function specBrowserName() {
+      const raw = document.getElementById('ckSpec').value.trim();
+      const m = /^([a-z]+)/i.exec(raw);
+      return m ? m[1].toLowerCase() : '';
+    }
+
+    function syncProfileSelect() {
+      const psel = document.getElementById('ckProfile');
+      const b = browserByName(specBrowserName());
+      const profiles = (b && b.profiles) || [];
+      psel.innerHTML = '<option value="">profile…</option>' + profiles.map(p =>
+        `<option value="${esc(p.spec)}">${esc(p.name)}</option>`
+      ).join('');
+      psel.style.display = profiles.length ? '' : 'none';
+      const raw = document.getElementById('ckSpec').value.trim();
+      const cur = raw.includes(':') ? raw.slice(raw.indexOf(':') + 1) : '';
+      if (cur && profiles.some(p => p.spec.endsWith(':' + cur))) psel.value = raw;
+    }
+
+    function onPickBrowser() {
+      const name = document.getElementById('ckBrowser').value;
+      const b = browserByName(name);
+      document.getElementById('ckSpec').value = b ? (b.suggest || b.name) : '';
+      syncProfileSelect();
+    }
+
+    function onPickProfile() {
+      const spec = document.getElementById('ckProfile').value;
+      if (spec) document.getElementById('ckSpec').value = spec;
+    }
+
+    async function saveCookies(ack) {
+      const payload = {
+        enabled: document.getElementById('ckEnabled').checked,
+        spec: document.getElementById('ckSpec').value.trim(),
+        file: document.getElementById('ckFile').value.trim(),
+        ack: !!ack,
+      };
+      try {
+        const res = await fetch('/api/cookies', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const d = await res.json();
+        if (!res.ok || d.error) {
+          setCookieTest(d.error || 'Failed to save', 'bad');
+          return false;
+        }
+        cookieState.config = d.config;
+        return true;
+      } catch (err) {
+        setCookieTest(err.message || 'Failed to save', 'bad');
+        return false;
+      }
+    }
+
+    async function onCookiesToggle(on) {
+      document.getElementById('authBody').style.display = on ? 'flex' : 'none';
+      if (on && !(cookieState.config || {}).ack) {
+        showCookieWarning();
+        return;
+      }
+      await saveCookies(false);
+    }
+
+    function setCookieTest(text, cls) {
+      const el = document.getElementById('ckTestResult');
+      el.textContent = text;
+      el.className = 'auth-note' + (cls ? ' ' + cls : '');
+    }
+
+    async function testCookies() {
+      const spec = document.getElementById('ckSpec').value.trim();
+      if (!spec) { setCookieTest('Fill in the browser spec first', 'bad'); return; }
+      setCookieTest('Testing...', '');
+      if (!await saveCookies(true)) return;
+      document.getElementById('ckBrowserNote').textContent = '';
+      try {
+        const res = await fetch('/api/cookies/test', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        const d = await res.json();
+        setCookieTest(d.detail || (d.ok ? 'works' : 'failed'), d.ok ? 'ok' : 'bad');
+      } catch (err) {
+        setCookieTest(err.message || 'Test failed', 'bad');
+      }
+    }
+
+    function showCookieWarning() {
+      if (document.getElementById('ckModal')) return;
+      const back = document.createElement('div');
+      back.className = 'modal-backdrop';
+      back.id = 'ckModal';
+      back.innerHTML = `
+        <div class="modal">
+          <h3>ClipNip will read your browser cookies</h3>
+          <p>ClipNip passes the browser profile path to yt-dlp, which reads that profile's cookie database and sends a site only the cookies belonging to it.</p>
+          <p>Passwords and card details are not read. Cookies are not written to disk — Chromium databases are encrypted by Windows (DPAPI).</p>
+          <p>Cookies are never written to the ClipNip log.</p>
+          <div class="modal-actions">
+            <button class="card-dl-btn" onclick="closeCookieWarning(true)">Enable</button>
+            <button class="settings-btn" onclick="closeCookieWarning(false)">Not now</button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(back);
+    }
+
+    async function closeCookieWarning(accept) {
+      document.getElementById('ckModal')?.remove();
+      const box = document.getElementById('ckEnabled');
+      if (!accept) {
+        box.checked = false;
+        document.getElementById('authBody').style.display = 'none';
+        await saveCookies(false);
+        return;
+      }
+      await saveCookies(true);
+    }
+
+    loadCookies();
 
     const dirInput = document.getElementById('dirInput');
     dirInput.addEventListener('change', applyDir);

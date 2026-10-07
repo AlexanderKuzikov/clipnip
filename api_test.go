@@ -1,14 +1,29 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+// Конфиг уводим во временный каталог: тесты не должны писать в реальный
+// config.json пользователя (и затирать download_dir).
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "clipnip-test-config")
+	if err != nil {
+		panic(err)
+	}
+	configDirOverride = dir
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
+}
 
 func TestFontsServe(t *testing.T) {
 	ts := httptest.NewServer(newAPI())
@@ -77,12 +92,221 @@ func TestWaitReachDoesNotBlockForever(t *testing.T) {
 	}
 }
 
+func TestCookiesDisabledByDefault(t *testing.T) {
+	// Поведение с выключенными cookies не должно отличаться ни на байт:
+	// cookieArgs обязан быть пустым, иначе чужой конфиг утечёт в загрузку.
+	setCookies(false, "chrome", "", false)
+	t.Cleanup(func() { setCookies(false, "", "", false) })
+	if got := cookieArgs(); len(got) != 0 {
+		t.Errorf("cookies must be off by default, got %v", got)
+	}
+	if got := cookiesSpec(); got != "" {
+		t.Errorf("spec must be empty when disabled, got %q", got)
+	}
+}
+
+func TestCookieArgsComposition(t *testing.T) {
+	t.Cleanup(func() { setCookies(false, "", "", false) })
+
+	setCookies(true, "edge:Profile 1", "", false)
+	got := cookieArgs()
+	want := []string{"--cookies-from-browser", "edge:Profile 1"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+
+	// Файл и браузер складываются вместе: yt-dlp сам объединяет обе банки.
+	file := filepath.Join(t.TempDir(), "cookies.txt")
+	if err := os.WriteFile(file, []byte("# Netscape HTTP Cookie File\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setCookies(true, "chrome", file, false)
+	got = cookieArgs()
+	if len(got) != 4 || got[0] != "--cookies-from-browser" || got[2] != "--cookies" || got[3] != file {
+		t.Errorf("file + browser composition wrong: %v", got)
+	}
+
+	// Несуществующий файл молча пропускаем, а не ломаем вызов.
+	setCookies(true, "chrome", filepath.Join(t.TempDir(), "nope.txt"), false)
+	if got := cookieArgs(); len(got) != 2 {
+		t.Errorf("missing file must be skipped, got %v", got)
+	}
+}
+
+// Спецификация попадает в argv — мусорный config.json не должен превратиться
+// в аргументы yt-dlp.
+func TestCookiesSpecValidation(t *testing.T) {
+	t.Cleanup(func() { setCookies(false, "", "", false) })
+	good := []string{
+		"chrome",
+		"edge:Profile 1",
+		`chromium:C:\Users\u\AppData\Local\Yandex\YandexBrowser\User Data\Default`,
+		"firefox:abc123.default-release",
+	}
+	for _, s := range good {
+		setCookies(true, s, "", false)
+		if got := cookiesSpec(); got != s {
+			t.Errorf("spec %q rejected, got %q", s, got)
+		}
+	}
+	bad := []string{
+		"--cookies",      // выглядит как флаг
+		"-o/tmp/evil",    // ведущий дефис
+		"chrome; rm -rf", // разделители команд
+		"chrome\x00",     // NUL
+		"$(whoami)",      // подстановка
+	}
+	for _, s := range bad {
+		setCookies(true, s, "", false)
+		if got := cookiesSpec(); got != "" {
+			t.Errorf("spec %q must be rejected, got %q", s, got)
+		}
+	}
+}
+
+// Два задокументированных сбоя чтения cookies переводим в человеческий язык:
+// на расшифровке DPAPI yt-dlp поднимает DownloadError с «force exit», то есть
+// ломает весь процесс, включая обычное скачивание.
+func TestHumanizeCookieError(t *testing.T) {
+	cases := map[string]string{
+		"Could not copy Chrome cookie database":         "Закройте браузер",
+		"Failed to decrypt with DPAPI. See issue 10927": "DPAPI",
+		"could not find chrome cookies database":        "не найдена",
+		"failed to load cookies":                        "не загрузились",
+	}
+	for msg, want := range cases {
+		got := humanizeCookieError(msg)
+		if got == "" {
+			t.Errorf("humanizeCookieError(%q) returned nothing", msg)
+			continue
+		}
+		if !strings.Contains(got, want) {
+			t.Errorf("humanizeCookieError(%q) = %q, want substring %q", msg, got, want)
+		}
+	}
+	// Обычные ошибки не должны переписываться
+	if got := humanizeCookieError("HTTP Error 429: Too Many Requests"); got != "" {
+		t.Errorf("unrelated error must pass through, got %q", got)
+	}
+}
+
+func TestDetectCookieBrowsersShape(t *testing.T) {
+	list := detectCookieBrowsers()
+	if len(list) != len(cookieBrowsers) {
+		t.Fatalf("want %d browsers, got %d", len(cookieBrowsers), len(list))
+	}
+	seen := map[string]bool{}
+	for _, b := range list {
+		if b.Name == "" || b.Label == "" {
+			t.Errorf("browser without name/label: %+v", b)
+		}
+		if seen[b.Name] {
+			t.Errorf("duplicate browser %q", b.Name)
+		}
+		seen[b.Name] = true
+		// Suggest обязан быть валидной спецификацией, иначе автоподстановка
+		// даст мусор, который config.go отвергнет.
+		if b.Suggest != "" {
+			setCookies(true, b.Suggest, "", false)
+			if cookiesSpec() == "" {
+				t.Errorf("suggest %q for %s is not a valid spec", b.Suggest, b.Name)
+			}
+			setCookies(false, "", "", false)
+		}
+	}
+	for _, want := range []string{"chrome", "edge", "firefox"} {
+		if !seen[want] {
+			t.Errorf("yt-dlp supports %q — must be in the list", want)
+		}
+	}
+}
+
+// Профили сортируются свежим первым — так же, как их выбирает сам yt-dlp,
+// когда профиль не указан (берёт самый свежий Cookies).
+func TestProfilesSortedByMTime(t *testing.T) {
+	base := t.TempDir()
+	mk := func(name string, ts time.Time) {
+		d := filepath.Join(base, name)
+		os.MkdirAll(filepath.Join(d, "Network"), 0o755)
+		os.WriteFile(filepath.Join(d, "Network", "Cookies"), []byte("x"), 0o600)
+		os.Chtimes(filepath.Join(d, "Network", "Cookies"), ts, ts)
+	}
+	old := time.Now().Add(-72 * time.Hour)
+	newer := time.Now().Add(-time.Hour)
+	mk("Profile Old", old)
+	mk("Profile New", newer)
+
+	got := profilesByMTime([]profileInfo{
+		{Name: "Profile Old", MTime: old.UTC().Format(time.RFC3339)},
+		{Name: "Profile New", MTime: newer.UTC().Format(time.RFC3339)},
+	})
+	if got[0].Name != "Profile New" {
+		t.Errorf("newest profile must come first, got %q", got[0].Name)
+	}
+}
+
+func TestCookiesEndpoints(t *testing.T) {
+	setCookies(false, "", "", false)
+	t.Cleanup(func() { setCookies(false, "", "", false) })
+	ts := httptest.NewServer(newAPI())
+	defer ts.Close()
+
+	// GET: список браузеров + текущая конфигурация
+	resp, err := http.Get(ts.URL + "/api/cookies")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/cookies = %d", resp.StatusCode)
+	}
+	var got struct {
+		Config   map[string]any `json:"config"`
+		Browsers []browserInfo  `json:"browsers"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("bad json: %v (%s)", err, body)
+	}
+	if len(got.Browsers) == 0 {
+		t.Error("browsers list must not be empty")
+	}
+
+	// POST: мусорная спецификация отвергается, а не сохраняется
+	bad, _ := http.Post(ts.URL+"/api/cookies", "application/json",
+		strings.NewReader(`{"enabled":true,"spec":"--cookies"}`))
+	badBody, _ := io.ReadAll(bad.Body)
+	bad.Body.Close()
+	if bad.StatusCode != http.StatusBadRequest {
+		t.Errorf("bad spec must be rejected, got %d (%s)", bad.StatusCode, badBody)
+	}
+	if cookiesSpec() != "" {
+		t.Error("rejected spec must not be stored")
+	}
+
+	// POST: валидная спецификация сохраняется
+	ok, _ := http.Post(ts.URL+"/api/cookies", "application/json",
+		strings.NewReader(`{"enabled":true,"spec":"chrome","ack":true}`))
+	ok.Body.Close()
+	if ok.StatusCode != http.StatusOK {
+		t.Fatalf("valid spec rejected: %d", ok.StatusCode)
+	}
+	if cookiesSpec() != "chrome" {
+		t.Errorf("spec not saved, got %q", cookiesSpec())
+	}
+}
+
 func TestPlaylistDetection(t *testing.T) {
 	cases := map[string]bool{
 		"https://www.youtube.com/playlist?list=PL7I7TsNvvxnN95A4teM8_Qn4-dbB0mz3l": true,
-		"https://youtu.be/jbR-fKl4g94?si=6dOEwfJTJBQjf8ve":                          false,
-		"https://www.youtube.com/watch?v=abc&list=PL7I7":                            false,
-		"https://www.youtube.com/playlists/foo":                                     true,
+		"https://youtu.be/jbR-fKl4g94?si=6dOEwfJTJBQjf8ve":                         false,
+		"https://www.youtube.com/watch?v=abc&list=PL7I7":                           false,
+		"https://www.youtube.com/playlists/foo":                                    true,
 	}
 	for u, want := range cases {
 		if got := isPlaylistURL(u); got != want {
@@ -117,30 +341,30 @@ func TestPlaylistEntries(t *testing.T) {
 func TestClassifyError(t *testing.T) {
 	cases := map[string]string{
 		// троттлинг
-		"HTTP Error 429: Too Many Requests": "throttle",
+		"HTTP Error 429: Too Many Requests":  "throttle",
 		"[youtube] Video: Too Many Requests": "throttle",
 		// отказ отдачи: extractor отработал (в логе виден выбор форматов),
 		// но видеопоток не отдали — это устаревший движок, а не перегрузка
 		"unable to download video data: HTTP Error 403: Forbidden": "engine",
-		"unable to download api page: HTTP Error 403: Forbidden":  "engine",
+		"unable to download api page: HTTP Error 403: Forbidden":   "engine",
 		// отказ сайта: нужен бот-чек/cookies
-		"HTTP Error 403: Forbidden": "site",
+		"HTTP Error 403: Forbidden":                                       "site",
 		"Sign in to confirm you're not a bot. Use --cookies-from-browser": "site",
-		"Sign in to confirm you’re not a bot": "site",
-		"This video is age-restricted": "site",
+		"Sign in to confirm you’re not a bot":                             "site",
+		"This video is age-restricted":                                    "site",
 		// фатальные
 		"Requested format is not available": "fatal",
 		"Video unavailable":                 "fatal",
-		"This video is not available":        "fatal",
+		"This video is not available":       "fatal",
 		"This video is private":             "fatal",
 		"Private video":                     "fatal",
 		"Unsupported URL: ftp://x":          "fatal",
 		"Video unavailable in your country": "fatal",
 		"HTTP Error 404: Not Found":         "fatal",
 		// сеть
-		"[generic] timed out":          "network",
-		"stalled: no progress":         "network",
-		"Read timed out after 15000ms": "network",
+		"[generic] timed out":                 "network",
+		"stalled: no progress":                "network",
+		"Read timed out after 15000ms":        "network",
 		"HTTP Error 503: Service Unavailable": "network",
 	}
 	for msg, want := range cases {
@@ -207,12 +431,30 @@ func TestSiteRefusalKeepsPool(t *testing.T) {
 }
 
 func TestErrorHint(t *testing.T) {
+	setCookies(false, "", "", false)
+	t.Cleanup(func() { setCookies(false, "", "", false) })
+
 	if errorHint(errEngine) == "" {
 		t.Error("stale engine needs a hint pointing at the rebuild")
 	}
-	if errorHint(errSite) == "" {
-		t.Error("site refusal needs a hint pointing at cookies")
+	siteHint := errorHint(errSite)
+	if siteHint == "" {
+		t.Fatal("site refusal needs a hint pointing at cookies")
 	}
+	if !strings.Contains(siteHint, "cookies") {
+		t.Errorf("site hint should mention cookies, got %q", siteHint)
+	}
+
+	// Cookies уже включены: совет «включи cookies» уводит по кругу.
+	setCookies(true, "chrome", "", false)
+	active := errorHint(errSite)
+	if active == siteHint {
+		t.Error("hint must differ when cookies are already enabled")
+	}
+	if strings.Contains(active, "Enabling cookies") {
+		t.Errorf("circular advice when cookies are on: %q", active)
+	}
+
 	if h := errorHint(errNetwork); h != "" {
 		t.Errorf("network errors need no hint, got %q", h)
 	}

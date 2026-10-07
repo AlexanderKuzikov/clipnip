@@ -25,8 +25,11 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
   - `GET/POST /api/settings` — папка загрузки (`download_dir` или `browse`: нативный диалог SHBrowseForFolderW)
   - `POST /api/engine` — версия движка, наличие ffmpeg, флаг `stale`
   - `POST /api/reach` — вердикт транспортной доступности домена
+  - `GET/POST /api/cookies` — детект браузеров + настройка авторизации
+  - `POST /api/cookies/test` — пробная авторизация (сухой `/api/info`)
   - При ошибке `/api/info` отдаёт `reach` + `reach_detail` (UI показывает их важнее текста yt-dlp)
-- `config.go` — конфиг в `%LOCALAPPDATA%\clipnip\config.json`; папка загрузки хранится там.
+- `config.go` — конфиг в `%LOCALAPPDATA%\clipnip\config.json`; `download_dir` + cookies (`cookies_enabled`/`cookies_spec`/`cookies_file`/`cookies_ack`). `configDirOverride` — переопределение каталога конфига, используется тестами (`TestMain`), чтобы юнит-тесты не писали в реальный конфиг.
+- `cookies.go` — автодетект браузеров по путям из исходников yt-dlp, профили свежим первым; `cookieArgs()` для вызовов yt-dlp; `humanizeCookieError` (два задокументированных сбоя чтения cookies → человеческий язык). Спецификация = формат самого yt-dlp: `chrome`, `edge:Profile 1`, `chromium:C:\...\Default`.
 - `jobs.go` — джобы в памяти; **таксономия ошибок 5 классов** (`classifyError`): `throttle` / `engine` (extractor отработал, поток не отдали → движок устарел) / `site` (отказ сайта: бот-чек, нет авторизации) / `fatal` / `network`. `affectsParallelism` — только throttle+network режут пул и берут cooldown (30 с при 429); `retriable` — кроме engine и fatal; `errorHint` → actionable-текст в UI. Адаптивная параллельность (старт 8, потолок 10, пол 1; +1 за 15 успешных; ÷2 при throttle/network), очередь 1024 + приоритетная retryQueue; сетевой отказ → requeue с backoff 5с×N (до 2 повторов, потолок суммарно 90 с); watchdog 60 с без роста байтов → kill + error; кнопка Retry только для фатальных; чистка `.part` старше 24 ч; пропуск уже скачанных: перед стартом yt-dlp проверка `title` + расширение режима в папке загрузки → статус `skipped` (обход — флаг `force` в /api/download, «Download anyway»); имя файла — title из /api/info (фолбэк: fetchTitle, 15 c), переименование с защитой от коллизий `(1)`.
 - `ytdlp.go` — subprocess yt-dlp, прогресс-парсер, stall-детект (20 с без прогресса → kill+retry), распаковка из embed, kill-tree, `probeEngine()` (версия движка, кэш, вызывается из main и `/api/engine`). Плейлисты: `--flat-playlist --playlist-items 1-500`, таймаут 90 с. `--ignore-config` во всех трёх вызовах.
 - `netprobe.go` — `probeReach` (DNS + TCP:443), `probeReachAsync` (гонка с `/api/info`), `waitReach`, `envProxySet`. Вердикты: `ok` / `dns` / `tcp` / `proxy` / `unknown`.
@@ -66,6 +69,9 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
 12. **`unable to download video data` — маркер устаревшего движка.** Эта строка бывает только в загрузчике, то есть extractor уже вернул форматы; ловится первой строкой в `classifyError`, до проверок на 403.
 13. **Пользовательский `%APPDATA%\yt-dlp\config` может всё сломать** (свой `--output`, `--proxy`, `--cookies`) — поэтому `--ignore-config` во всех вызовах.
 14. **Прямой доступ к YouTube и части сайтов закрыт по сети РФ**, нужен VPN. ClipNip наследует маршрут системы; если в окружении задан `HTTP(S)_PROXY`/`ALL_PROXY`, проба сети обязана молчать, а не гадать по прямому TCP.
+15. **Сбой чтения cookies у yt-dlp роняет ВЕСЬ процесс.** На ошибке расшифровки DPAPI yt-dlp поднимает `DownloadError` с комментарием «force exit» — не просто «не прочитал cookies», а полный отказ. Включённые cookies способны сломать скачивание вообще всего, включая обычный YouTube. Отсюда обязательная кнопка Test и человеческий перевод сбоев (занятая база — issue 7271, DPAPI — issue 10927).
+16. **Любой Chromium-форк читается через `chromium:<каталог-профиля>`** — спецификация yt-dlp принимает путь вместо имени. Не нужно перечислять Yandex.Browser и прочие: точечно указываем путь к профилю (не к `User Data` — `Local State` ищется уровнем выше).
+17. **Тесты не должны писать в рантайм-каталоги.** `configDirOverride` + `TestMain` уводят конфиг в temp; без этого юнит-тест на cookies затирает `download_dir` пользователя (уже случалось).
 
 ## Места хранения
 

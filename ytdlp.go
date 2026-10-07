@@ -183,6 +183,9 @@ func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 	if ff := ffmpegPath(dir); ff != "" {
 		args = append([]string{"--ffmpeg-location", ff}, args...)
 	}
+	// cookies добавляются последними: явная настройка пользователя должна
+	// перебивать всё, что выше
+	args = append(args, cookieArgs()...)
 
 	cmd := exec.Command(ytdlp, args...)
 	cmd.Env = append(os.Environ(), "PYTHONIOENCODING=utf-8")
@@ -265,7 +268,11 @@ func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 		msg := strings.TrimSpace(errBuf.String())
 		if msg != "" {
 			msg = errStripRe.ReplaceAllString(msg, "")
-			return errors.New(strings.TrimSpace(msg))
+			msg = strings.TrimSpace(msg)
+			if hint := humanizeCookieError(msg); hint != "" {
+				return errors.New(hint)
+			}
+			return errors.New(msg)
 		}
 	}
 	return err
@@ -314,6 +321,7 @@ func infoJSON(url string, playlist bool) (map[string]any, error) {
 	} else {
 		args = append(args, "--no-playlist")
 	}
+	args = append(args, cookieArgs()...)
 	args = append(args, url)
 
 	cmd := exec.Command(ytdlp, args...)
@@ -342,7 +350,11 @@ func infoJSON(url string, playlist bool) (map[string]any, error) {
 			msg := strings.TrimSpace(errBuf.String())
 			if msg != "" {
 				msg = errStripRe.ReplaceAllString(msg, "")
-				return nil, errors.New(strings.TrimSpace(msg))
+				msg = strings.TrimSpace(msg)
+				if hint := humanizeCookieError(msg); hint != "" {
+					return nil, errors.New(hint)
+				}
+				return nil, errors.New(msg)
 			}
 			return nil, err
 		}
@@ -367,7 +379,11 @@ func fetchTitle(url string) (string, error) {
 	}
 	ytdlp := filepath.Join(dir, "yt-dlp.exe")
 
-	cmd := exec.Command(ytdlp, "--no-warnings", "--ignore-config", "--no-playlist", "--print", "title", url)
+	args := []string{"--no-warnings", "--ignore-config", "--no-playlist", "--print", "title"}
+	args = append(args, cookieArgs()...)
+	args = append(args, url)
+
+	cmd := exec.Command(ytdlp, args...)
 	cmd.Env = append(os.Environ(), "PYTHONIOENCODING=utf-8")
 	cmd.SysProcAttr = noWindow()
 

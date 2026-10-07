@@ -31,6 +31,33 @@ func isAllowedURL(raw string) bool {
 
 var playlistURLRe = regexp.MustCompile(`(?i)(/playlist\?|/playlists/)`)
 
+// cookieTestURL — стабильный ролик для пробной проверки cookies.
+const cookieTestURL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+// friendlyErrorBackend — серверный аналог одноимённой функции в UI.
+// UI версия оставлена для показа, здесь — чтобы не тащить её в Go.
+func friendlyErrorBackend(err string) string {
+	lower := strings.ToLower(err)
+	switch {
+	case strings.Contains(lower, "unable to download video data"),
+		strings.Contains(lower, "unable to download api page"):
+		return "Движок не может получить поток — версия yt-dlp устарела."
+	case strings.Contains(lower, "sign in to confirm"),
+		strings.Contains(lower, "http error 401"),
+		strings.Contains(lower, "http error 403"):
+		return "Сайт отказал — нужна авторизация. Cookies не помогли."
+	case strings.Contains(lower, "http error 429"):
+		return "Сайт временно ограничил запросы."
+	case strings.Contains(lower, "timed out"):
+		return "Таймаут — проверьте доступность сайта."
+	}
+	// Обрезка по рунам: []byte-слайс по кириллице даёт битую последнюю букву.
+	if r := []rune(err); len(r) > 140 {
+		return string(r[:140]) + "..."
+	}
+	return err
+}
+
 func isPlaylistURL(raw string) bool {
 	return playlistURLRe.MatchString(raw)
 }
@@ -105,10 +132,10 @@ func newAPI() http.Handler {
 		}
 		version, hasFFmpeg := probeEngine()
 		writeJSON(w, http.StatusOK, map[string]any{
-			"version": version,
+			"version":  version,
 			"embedded": ytdlpVersion,
-			"stale":   version != "" && version != ytdlpVersion,
-			"ffmpeg":  hasFFmpeg,
+			"stale":    version != "" && version != ytdlpVersion,
+			"ffmpeg":   hasFFmpeg,
 		})
 	})
 
@@ -117,7 +144,9 @@ func newAPI() http.Handler {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
 			return
 		}
-		var req struct{ URL string `json:"url"` }
+		var req struct {
+			URL string `json:"url"`
+		}
 		json.NewDecoder(r.Body).Decode(&req)
 		u := strings.TrimSpace(req.URL)
 		if !isAllowedURL(u) {
@@ -125,6 +154,98 @@ func newAPI() http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, probeReach(u))
+	})
+
+	mux.HandleFunc("/api/cookies", func(w http.ResponseWriter, r *http.Request) {
+		config.RLock()
+		current := map[string]any{
+			"enabled":   config.CookiesEnabled,
+			"spec":      config.CookiesSpec,
+			"file":      config.CookiesFile,
+			"ack":       config.CookiesAck,
+			"active":    cookiesSpec() != "" || cookiesFilePath() != "",
+			"suggested": suggestedCookieSpec(),
+		}
+		config.RUnlock()
+
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(w, http.StatusOK, map[string]any{
+				"config":   current,
+				"browsers": detectCookieBrowsers(),
+			})
+
+		case http.MethodPost:
+			var req struct {
+				Enabled bool   `json:"enabled"`
+				Spec    string `json:"spec"`
+				File    string `json:"file"`
+				Ack     bool   `json:"ack"`
+			}
+			json.NewDecoder(r.Body).Decode(&req)
+
+			spec := strings.TrimSpace(req.Spec)
+			if spec != "" && !cookiesSpecRe.MatchString(spec) {
+				writeJSON(w, http.StatusBadRequest, map[string]string{
+					"error": "Некорректная спецификация браузера. Пример: chrome или edge:Profile 1",
+				})
+				return
+			}
+			if err := setCookies(req.Enabled, spec, req.File, req.Ack); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				return
+			}
+			config.RLock()
+			current["enabled"] = config.CookiesEnabled
+			current["spec"] = config.CookiesSpec
+			current["file"] = config.CookiesFile
+			current["ack"] = config.CookiesAck
+			config.RUnlock()
+			current["active"] = cookiesSpec() != "" || cookiesFilePath() != ""
+			writeJSON(w, http.StatusOK, map[string]any{"config": current})
+
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
+		}
+	})
+
+	// Пробная авторизация: сухой запуск /api/info с текущими cookies.
+	// Нужен потому, что сбой расшифровки DPAPI у yt-dlp роняет весь процесс
+	// («force exit»), то есть включённые cookies способны сломать вообще всё.
+	mux.HandleFunc("/api/cookies/test", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
+			return
+		}
+		var req struct {
+			URL string `json:"url"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		target := strings.TrimSpace(req.URL)
+		if target == "" {
+			target = cookieTestURL
+		}
+		if !isAllowedURL(target) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Only http/https URLs are allowed"})
+			return
+		}
+
+		_, err := infoJSON(target, false)
+		if err == nil {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok": true, "detail": "Cookies применены, доступ получен.",
+			})
+			return
+		}
+		msg := err.Error()
+		if hint := humanizeCookieError(msg); hint != "" {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "detail": hint})
+			return
+		}
+		kind := classifyError(msg)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": false, "kind": kind, "detail": friendlyErrorBackend(msg), "error": msg,
+		})
 	})
 
 	mux.HandleFunc("/api/settings", func(w http.ResponseWriter, r *http.Request) {
@@ -185,7 +306,9 @@ func newAPI() http.Handler {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
 			return
 		}
-		var req struct{ URL string `json:"url"` }
+		var req struct {
+			URL string `json:"url"`
+		}
 		json.NewDecoder(r.Body).Decode(&req)
 		u := strings.TrimSpace(req.URL)
 
@@ -207,18 +330,18 @@ func newAPI() http.Handler {
 			reach := waitReach(reachCh, 6*time.Second)
 			log.Printf("info failed url=%s reach=%s: %v", u, reach.Verdict, err)
 			writeJSON(w, http.StatusBadRequest, map[string]string{
-				"error":         err.Error(),
-				"reach":         reach.Verdict,
-				"reach_detail":  reach.Detail,
+				"error":        err.Error(),
+				"reach":        reach.Verdict,
+				"reach_detail": reach.Detail,
 			})
 			return
 		}
 
 		if entries := playlistEntries(info); len(entries) > 0 {
 			writeJSON(w, http.StatusOK, map[string]any{
-				"playlist":      true,
+				"playlist":       true,
 				"playlist_title": str(info["title"]),
-				"entries":       entries,
+				"entries":        entries,
 			})
 			return
 		}
