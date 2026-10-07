@@ -43,6 +43,14 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
 
 ## Обновление вшитых бинарников
 
+**Обычно обновлять не нужно:** сборка `clipnipremote` берёт движок с сервера
+(`components_url` в конфиге), и смена версии — это прогон
+`/usr/local/bin/update-clipnip-bins.sh` на `sat` (исходник — `scripts/`).
+Хеши пересчитываются там же, вручную ничего трогать не надо.
+
+Порядок ниже нужен только для **автономной** сборки (101 МБ), где всё лежит
+внутри exe.
+
 1. Скачать свежие `yt-dlp.exe`, `ffmpeg.exe` (GitHub / gyan.dev) и `deno.exe` (релиз denoland/deno, ассет `deno-x86_64-pc-windows-msvc.zip`). Только стабильный релиз yt-dlp — см. ADR 006 про канал.
 2. Запаковать в `embedded/` (имена: `yt-dlp.exe.gz`, `ffmpeg.exe.gz`, `deno.exe.gz`). `gzip` в PowerShell нет — пакуй любым gzip-инструментом (git bash, 7-Zip, python `gzip`). deno.exe уже упакован: gzip даёт 42.6 MB из 97.5 MB, экономить не на чем.
 3. **Поднять константы `ytdlpVersion` и `denoVersion` в `ytdlp.go`** под новые версии.
@@ -89,7 +97,10 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
 
 ## Места хранения
 
-- Бинарники (распакованные): `%LOCALAPPDATA%\clipnip\bin\` (yt-dlp.exe, ffmpeg.exe)
+- Бинарники (распакованные): `%LOCALAPPDATA%\clipnip\bin\` (yt-dlp.exe, ffmpeg.exe, deno.exe) — сюда же ставятся компоненты, скачанные с сервера
+- Portable-режим: `<каталог exe>\clipnip-bin\` — приоритетнее кэша, сеть не нужна
+- Сервер компонентов: `https://clipnip.135.106.192.125.nip.io` (`manifest.json` + бинарники), адрес в конфиге `components_url`
 - Конфиг: `%LOCALAPPDATA%\clipnip\config.json`
+- Очередь: `%LOCALAPPDATA%\clipnip\queue.json`
 - Скачанное: выбранная пользователем папка (по умолчанию `%USERPROFILE%\Downloads\ClipNip\`)
 - Docker/venv отсутствуют намеренно — проект десктопный, один exe.
