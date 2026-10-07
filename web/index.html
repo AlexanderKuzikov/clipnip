@@ -873,6 +873,21 @@
       </div>
     </div>
 
+    <div class="auth" id="componentsPanel">
+      <div class="auth-row">
+        <span class="auth-toggle" style="cursor:default">Engine components</span>
+        <span class="auth-note" id="compStatus"></span>
+      </div>
+      <div class="auth-body" id="compBody" style="display:none">
+        <div class="auth-row">
+          <input id="compUrl" type="text" spellcheck="false" placeholder="https://example.com/clipnip">
+          <button class="settings-btn" onclick="saveComponents()">Apply</button>
+        </div>
+        <div class="auth-note" id="compNote"></div>
+        <div class="auth-hint" id="compList"></div>
+      </div>
+    </div>
+
     <div class="mode-grid">
       <button class="mode-btn active" data-mode="video" onclick="setMode(this)">
         <span class="mode-label">Video MP4</span>
@@ -1175,6 +1190,63 @@
     }
 
     loadCookies();
+    loadComponents();
+
+    async function loadComponents() {
+      try {
+        const res = await fetch('/api/components', { cache: 'no-store' });
+        renderComponents(await res.json());
+      } catch { /* панель просто останется пустой */ }
+    }
+
+    function renderComponents(d) {
+      const note = document.getElementById('compNote');
+      document.getElementById('compUrl').value = d.url || '';
+      document.getElementById('compBody').style.display = d.ready ? 'none' : 'flex';
+
+      const status = document.getElementById('compStatus');
+      status.textContent = d.ready ? 'ready' : 'missing';
+      status.className = 'auth-note ' + (d.ready ? 'ok' : 'bad');
+
+      if (d.problem) {
+        note.textContent = d.problem;
+        note.className = 'auth-note bad';
+      } else {
+        note.textContent = d.portable ? 'Portable folder in use — no network needed.' : '';
+        note.className = 'auth-note';
+      }
+
+      const list = (d.components || []).map(c =>
+        `${c.name}: ${c.source}${c.version ? ' · ' + c.version : ''}`).join('  |  ');
+      document.getElementById('compList').textContent = list;
+    }
+
+    async function saveComponents() {
+      const note = document.getElementById('compNote');
+      note.textContent = 'Applying...';
+      note.className = 'auth-note';
+      try {
+        const res = await fetch('/api/components', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            url: document.getElementById('compUrl').value.trim(),
+            refresh: true,
+          }),
+        });
+        const d = await res.json();
+        if (!res.ok || d.error) {
+          note.textContent = d.error || 'Failed';
+          note.className = 'auth-note bad';
+          return;
+        }
+        renderComponents(d);
+        loadEngine();
+      } catch (err) {
+        note.textContent = err.message || 'Failed';
+        note.className = 'auth-note bad';
+      }
+    }
 
     async function showLog() {
       if (document.getElementById('logModal')) return;

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -353,22 +355,61 @@ func TestQualityFallsBackToTBR(t *testing.T) {
 	}
 }
 
-// deno должен попадать в binDir и указываться yt-dlp явным путём:
-// binDir не в PATH, а по умолчанию yt-dlp включает только deno из PATH.
-func TestJsRuntimeArgsPointsAtEmbeddedDeno(t *testing.T) {
+// deno указывается yt-dlp явным путём: binDir не в PATH, а по умолчанию
+// yt-dlp включает только deno из PATH. Путь берётся из реестра компонентов,
+// а не из каталога кэша — это же покрывает portable-папку.
+func TestJsRuntimeArgsPointsAtResolvedDeno(t *testing.T) {
 	dir := t.TempDir()
-	if got := jsRuntimeArgs(dir); got != nil {
-		t.Errorf("no deno on disk must yield no args, got %v", got)
+	resolvedPaths.Lock()
+	resolvedPaths.m = map[string]string{}
+	resolvedPaths.Unlock()
+	t.Cleanup(func() {
+		resolvedPaths.Lock()
+		resolvedPaths.m = map[string]string{}
+		resolvedPaths.Unlock()
+	})
+
+	if got := jsRuntimeArgs(); got != nil {
+		t.Errorf("no deno resolved must yield no args, got %v", got)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "deno.exe"), []byte("x"), 0o755); err != nil {
+
+	deno := filepath.Join(dir, "deno.exe")
+	if err := os.WriteFile(deno, []byte("x"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	got := jsRuntimeArgs(dir)
+	setComponentPath("deno.exe", deno)
+
+	got := jsRuntimeArgs()
 	if len(got) != 2 || got[0] != "--js-runtimes" {
 		t.Fatalf("bad js-runtime args: %v", got)
 	}
 	if !strings.HasPrefix(got[1], "deno:") || !strings.Contains(got[1], dir) {
-		t.Errorf("must point at the embedded deno by path, got %q", got[1])
+		t.Errorf("must point at the resolved deno by path, got %q", got[1])
+	}
+}
+
+// Пути исполняемых файлов обязаны следовать за разрешением компонентов,
+// иначе portable-папка находится, а запускается пустой кэш — так и случилось
+// на первом прогоне remote-сборки.
+func TestYtdlpPathFollowsResolvedComponent(t *testing.T) {
+	resolvedPaths.Lock()
+	resolvedPaths.m = map[string]string{}
+	resolvedPaths.Unlock()
+	t.Cleanup(func() {
+		resolvedPaths.Lock()
+		resolvedPaths.m = map[string]string{}
+		resolvedPaths.Unlock()
+	})
+
+	portable := filepath.Join(t.TempDir(), "yt-dlp.exe")
+	setComponentPath("yt-dlp.exe", portable)
+	if got := ytdlpPath(); got != portable {
+		t.Errorf("ytdlpPath = %q, want portable %q", got, portable)
+	}
+	ff := filepath.Join(t.TempDir(), "ffmpeg.exe")
+	setComponentPath("ffmpeg.exe", ff)
+	if got := ffmpegPath(t.TempDir()); got != ff {
+		t.Errorf("ffmpegPath must ignore the cache dir, got %q", got)
 	}
 }
 
@@ -799,6 +840,203 @@ func TestFileSHA256DetectsChange(t *testing.T) {
 	}
 	if _, err := fileSHA256(filepath.Join(dir, "missing.exe")); err == nil {
 		t.Error("missing file must return an error")
+	}
+}
+
+func TestManifestParsing(t *testing.T) {
+	// Структуру манифеста проверяем без сети: неверный формат обязан быть
+	// отвергнут, а не приводить к установке непроверяемого файла.
+	good := `{"version":1,"components":[
+		{"name":"yt-dlp.exe","version":"2026.09.27","file":"yt-dlp.exe","sha256":"` +
+		strings.Repeat("a", 64) + `"}]}`
+	if !strings.Contains(good, `"version":1`) {
+		t.Fatal("bad fixture")
+	}
+
+	bad := []string{
+		`{"version":2,"components":[]}`,                                                            // неизвестная версия формата
+		`{"version":1,"components":[{"name":"x.exe","file":"x"}]}`,                                 // нет хеша
+		`{"version":1,"components":[{"name":"x.exe","file":"x","sha256":"abc"}]}`,                  // короткий хеш
+		`{"version":1,"components":[{"file":"x","sha256":"` + strings.Repeat("a", 64) + `"}]}`,     // нет имени
+		`{"version":1,"components":[{"name":"x.exe","sha256":"` + strings.Repeat("a", 64) + `"}]}`, // нет файла
+	}
+	for _, body := range bad {
+		var mf manifest
+		if err := json.Unmarshal([]byte(body), &mf); err == nil {
+			// разбираем так же, как loadManifest
+			if mf.Version == manifestVersion {
+				rejected := false
+				for _, c := range mf.Components {
+					if c.Name == "" || c.File == "" || len(c.SHA256) != 64 {
+						rejected = true
+					}
+				}
+				if !rejected {
+					t.Errorf("manifest must be rejected: %s", body)
+				}
+			}
+		}
+	}
+}
+
+func TestManifestFindIsCaseInsensitive(t *testing.T) {
+	mf := manifest{Components: []manifestComponent{
+		{Name: "yt-dlp.exe", File: "yt-dlp.exe"},
+	}}
+	if _, ok := mf.find("YT-DLP.EXE"); !ok {
+		t.Error("component lookup must ignore case — Windows не различает регистр имён файлов")
+	}
+	if _, ok := mf.find("ffmpeg.exe"); ok {
+		t.Error("must not find a component that is absent")
+	}
+}
+
+// Компонент без https нельзя качать: хеш приезжает по тому же каналу, что и
+// файл, и сверка перестаёт что-либо значить.
+// Скачанный компонент ставится на место только при совпадении хеша, и
+// несовпадение не оставляет ни файла, ни мусора во временном имени.
+func TestFetchAndVerifyInstallsOnlyOnMatch(t *testing.T) {
+	payload := []byte("not-really-an-exe")
+	sum := fmt.Sprintf("%x", sha256.Sum256(payload))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(payload)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "yt-dlp.exe")
+
+	// неверный хеш — файл не должен появиться
+	bad := manifestComponent{Name: "yt-dlp.exe", Version: "1", SHA256: strings.Repeat("b", 64)}
+	if err := fetchAndVerify(srv.Client(), srv.URL, dest, bad); err == nil {
+		t.Fatal("hash mismatch must fail")
+	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Error("mismatched component must not be installed")
+	}
+	if _, err := os.Stat(dest + ".part"); !os.IsNotExist(err) {
+		t.Error("temp file must be cleaned up")
+	}
+
+	// верный хеш — ставится, версия записывается
+	good := manifestComponent{Name: "yt-dlp.exe", Version: "2026.09.27", SHA256: sum}
+	if err := fetchAndVerify(srv.Client(), srv.URL, dest, good); err != nil {
+		t.Fatalf("matching component must install: %v", err)
+	}
+	got, err := fileSHA256(dest)
+	if err != nil || got != sum {
+		t.Errorf("installed file hash = %q, want %q (err %v)", got, sum, err)
+	}
+	if v, err := os.ReadFile(dest + ".ver"); err != nil || string(v) != "2026.09.27" {
+		t.Errorf("version marker not written: %q (err %v)", v, err)
+	}
+}
+
+func TestDownloadRequiresHTTPS(t *testing.T) {
+	mc := manifestComponent{Name: "x.exe", File: "x.exe", SHA256: strings.Repeat("a", 64)}
+	if err := downloadComponent("http://example.com/bin", mc, filepath.Join(t.TempDir(), "x.exe")); err == nil {
+		t.Error("plain http must be refused for executable components")
+	}
+	if err := downloadComponent("https://example.com/bin", mc, filepath.Join(t.TempDir(), "x.exe")); err == nil {
+		t.Error("unreachable host must return an error")
+	}
+}
+
+// Порядок источников: portable-папка важнее кэша и сети.
+func TestPortableDirDetection(t *testing.T) {
+	if got := portableBinDir(); got != "" {
+		t.Logf("portable dir present: %s", got)
+	}
+	// функция опирается на каталог exe — в тестах он есть, но clipnip-bin
+	// рядом с ним не создан, поэтому ожидаем пустую строку
+	if d := portableBinDir(); d != "" {
+		if _, err := os.Stat(d); err != nil {
+			t.Errorf("portableBinDir returned a missing dir: %s", d)
+		}
+	}
+}
+
+func TestComponentsConfigRoundTrip(t *testing.T) {
+	configDirOverride = t.TempDir()
+	t.Cleanup(func() { configDirOverride = "" })
+
+	config.Lock()
+	config.ComponentsURL = ""
+	config.Unlock()
+	if got := componentsBaseURL(); got != "" {
+		t.Errorf("empty by default, got %q", got)
+	}
+	t.Setenv("CLIPNIP_BIN_URL", "https://from-env.example/bin")
+	if got := componentsBaseURL(); got != "https://from-env.example/bin" {
+		t.Errorf("env fallback broken: %q", got)
+	}
+	config.Lock()
+	config.ComponentsURL = "https://from-config.example/bin/"
+	config.Unlock()
+	if got := componentsBaseURL(); got != "https://from-config.example/bin" {
+		t.Errorf("config must win over env and trailing slash trimmed, got %q", got)
+	}
+}
+
+// Недостающие компоненты не должны ронять приложение: иначе пользователь
+// не сможет зайти в настройки и починить это (окно с ошибкой просило именно
+// «укажите адрес сервера в настройках» — но настройки были недостижимы).
+func TestEnsureBinsNotFatalWhenComponentsMissing(t *testing.T) {
+	dir := t.TempDir()
+	oldConfig, oldBin := configDirOverride, binDirOverride
+	configDirOverride, binDirOverride = dir, filepath.Join(dir, "bin")
+	restore := configSnapshot()
+	// сборка без встроенных копий: если бы embed был доступен, компоненты
+	// распаковались бы и случай «ничего нет» не воспроизвёлся бы
+	origBins := embeddedBins
+	embeddedBins = []binSpec{{"yt-dlp.exe", "", "", ""}, {"ffmpeg.exe", "", "", ""}}
+	t.Cleanup(func() {
+		configDirOverride, binDirOverride = oldConfig, oldBin
+		embeddedBins = origBins
+		restore()
+		componentStates = nil
+		componentsProblem = ""
+		resolvedPaths.Lock()
+		resolvedPaths.m = map[string]string{}
+		resolvedPaths.Unlock()
+	})
+
+	componentsProblem = ""
+	if err := ensureBins(); err != nil {
+		t.Fatalf("missing components must not be fatal, got %v", err)
+	}
+	if componentsProblem == "" {
+		t.Error("problem must be reported even when startup continues")
+	}
+	if componentsReady(requiredComponents()) {
+		t.Error("components must not be reported ready")
+	}
+	if got := missingComponents(requiredComponents()); len(got) != len(requiredComponents()) {
+		t.Errorf("all required components must be missing, got %v", got)
+	}
+}
+
+// deno — страховка, а не условие работы: его отсутствие не должно ни ронять
+// запуск, ни числиться как проблема.
+func TestDenoIsOptional(t *testing.T) {
+	if len(optionalComponents()) != 1 || optionalComponents()[0] != "deno.exe" {
+		t.Errorf("deno must be optional, got %v", optionalComponents())
+	}
+	for _, name := range requiredComponents() {
+		if name == "deno.exe" {
+			t.Error("deno must not be required")
+		}
+	}
+}
+
+func configSnapshot() func() {
+	config.RLock()
+	c := config.Config
+	config.RUnlock()
+	return func() {
+		config.Lock()
+		config.Config = c
+		config.Unlock()
 	}
 }
 

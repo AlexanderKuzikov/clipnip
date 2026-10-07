@@ -24,15 +24,13 @@ import (
 )
 
 const (
-	ytdlpGz  = "embedded/yt-dlp.exe.gz"
-	ffmpegGz = "embedded/ffmpeg.exe.gz"
-
-	// ytdlpVersion — версия вшитого yt-dlp. Сверяется с маркером рядом с
-	// распакованным бинарником: смена версии в embed принудительно
+	// ytdlpVersion — версия ожидаемого вшитого yt-dlp. Сверяется с маркером
+	// рядом с распакованным бинарником: смена версии в embed принудительно
 	// перераспаковывает файл (extractEmbedded иначе не перезаписывает).
 	// Канал — nightly, а не stable: YouTube ломает player-клипы каждые
 	// несколько недель, и фикс приезжает в master за дни. Обоснование и
-	// риски — ADR 006.
+	// риски — ADR 006. Пути к архивам объявлены в bins_embedded.go /
+	// bins_remote.go: сборка clipnipremote ничего не вшивает.
 	ytdlpVersion = "2026.09.27.232945"
 	denoVersion  = "2.9.7"
 )
@@ -45,7 +43,17 @@ type progressState struct {
 	Total      int64
 }
 
+// binDirOverride — переопределение каталога бинарников. Нужно тестам, чтобы
+// они не трогали реальный %LOCALAPPDATA% и не распаковывали 98 МБ.
+var binDirOverride string
+
 func binDir() (string, error) {
+	if binDirOverride != "" {
+		if err := os.MkdirAll(binDirOverride, 0o755); err != nil {
+			return "", err
+		}
+		return binDirOverride, nil
+	}
 	base, err := os.UserCacheDir()
 	if err != nil {
 		return "", err
@@ -78,7 +86,7 @@ func probeEngine() (string, bool, bool) {
 
 	dir, err := binDir()
 	if err == nil {
-		cmd := exec.Command(filepath.Join(dir, "yt-dlp.exe"), "--version")
+		cmd := exec.Command(ytdlpPath(), "--version")
 		cmd.Env = append(os.Environ(), "PYTHONIOENCODING=utf-8")
 		cmd.SysProcAttr = noWindow()
 		var out bytes.Buffer
@@ -87,15 +95,14 @@ func probeEngine() (string, bool, bool) {
 			engineInfo.version = strings.TrimSpace(out.String())
 		}
 		engineInfo.ffmpeg = ffmpegPath(dir) != ""
-		engineInfo.deno = len(jsRuntimeArgs(dir)) > 0
+		engineInfo.deno = len(jsRuntimeArgs()) > 0
 	}
 	return engineInfo.version, engineInfo.ffmpeg, engineInfo.deno
 }
 
-// binSpec — встроенный бинарник. sha256 обязателен для всего, чем ClipNip
-// управляет сам: содержимое embed — единственный источник истины, а файл в
-// %LOCALAPPDATA%\clipnip\bin лежит в пользовательской зоне. Пустой sha256
-// означает «не проверять» — так у ffmpeg оставлен ручной путь обновления.
+// binSpec — встроенный бинарник автономной сборки. sha256 обязателен: embed —
+// единственный источник истины для содержимого, а распакованный файл лежит в
+// пользовательской папке. Пустой gz означает «в этой сборке не вшит».
 type binSpec struct {
 	name    string
 	gz      string
@@ -109,7 +116,7 @@ type binSpec struct {
 var embeddedBins = []binSpec{
 	{"yt-dlp.exe", ytdlpGz, ytdlpVersion, "997c00e8f8ed91431b1ddaeeae519743602beb0b6df0903194a2632e57df1b31"},
 	{"deno.exe", denoGz, denoVersion, "e020f3e232bd16e33768dee528e5983349c962952051ced0a5d58ad42f5d9b33"},
-	{"ffmpeg.exe", ffmpegGz, "", ""},
+	{"ffmpeg.exe", ffmpegGz, "8.1.2", "1326dde4c84ff1f96fe6b8916c5bed29e163e9b5dccf995f6f3db069d143ec5e"},
 }
 
 func fileSHA256(path string) (string, error) {
@@ -125,16 +132,37 @@ func fileSHA256(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// ensureBins распаковывает бинарники из embed и сверяет их целостность.
+// requiredComponents — без чего ClipNip не работает. deno сюда не входит:
+// это страховка для машин без JS-рантайма, а не условие работы (проверено:
+// YouTube скачивается и без него).
+func requiredComponents() []string {
+	return []string{"yt-dlp.exe", "ffmpeg.exe"}
+}
+
+// optionalComponents — используются, если найдены, и никогда не мешают.
+func optionalComponents() []string {
+	return []string{"deno.exe"}
+}
+
+// componentsProblem — человеческое описание того, чего не хватает, или "".
+var componentsProblem string
+
+// ensureBins готовит компоненты к работе: portable-папка → кэш → сервер.
+//
+// Недостающие компоненты НЕ фатальны: приложение обязано подняться, чтобы
+// пользователь мог зайти в настройки и указать адрес сервера. Фатальная
+// ошибка тут означала бы «зайди в настройки» из окна, которого нет.
 func ensureBins() error {
-	dir, err := binDir()
-	if err != nil {
+	needed := append(requiredComponents(), optionalComponents()...)
+	if err := resolveComponents(needed); err != nil {
 		return err
 	}
-	for _, b := range embeddedBins {
-		if err := extractEmbedded(dir, b); err != nil {
-			return fmt.Errorf("%s: %w", b.name, err)
-		}
+	if missing := missingComponents(requiredComponents()); len(missing) > 0 {
+		componentsProblem = "Не удалось получить компоненты: " + strings.Join(missing, ", ") +
+			". Укажите адрес сервера в настройках или положите их в папку clipnip-bin рядом с exe"
+		log.Printf("components: %s", componentsProblem)
+	} else {
+		componentsProblem = ""
 	}
 	return nil
 }
@@ -160,7 +188,7 @@ func extractEmbedded(dir string, b binSpec) error {
 			log.Printf("integrity: %s differs on disk, re-extracting from embed", b.name)
 		}
 	} else if _, err := os.Stat(dest); err == nil {
-		return nil // без хеша доверяем файлу как есть (ручное обновление)
+		return nil // без хеша доверяем файлу как есть
 	}
 
 	gz, err := assetsDir.Open(b.gz)
@@ -210,8 +238,11 @@ func extractEmbedded(dir string, b binSpec) error {
 // обязателен, а страховка от смены этого поведения. Оставлять нечем: node на
 // машине отсутствует (yt-dlp пишет "node (unavailable)"), так что если бы
 // deno не подхватился автоматически, JS-рантайма не было бы вообще никакого.
-func jsRuntimeArgs(dir string) []string {
-	p := filepath.Join(dir, "deno.exe")
+func jsRuntimeArgs() []string {
+	p := componentPath("deno.exe")
+	if p == "" {
+		return nil
+	}
 	if _, err := os.Stat(p); err != nil {
 		return nil
 	}
@@ -220,6 +251,9 @@ func jsRuntimeArgs(dir string) []string {
 
 // ffmpegPath — путь к распакованному ffmpeg, "" если его нет.
 func ffmpegPath(dir string) string {
+	if p := componentPath("ffmpeg.exe"); p != "" {
+		return p
+	}
 	p := filepath.Join(dir, "ffmpeg.exe")
 	if _, err := os.Stat(p); err != nil {
 		return ""
@@ -242,7 +276,7 @@ func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 	if err := ensureBins(); err != nil {
 		return err
 	}
-	ytdlp := filepath.Join(dir, "yt-dlp.exe")
+	ytdlp := ytdlpPath()
 
 	args = append([]string{
 		"--no-warnings",
@@ -252,7 +286,7 @@ func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 		"--ignore-config",
 		"--progress-template", progressTemplate,
 	}, args...)
-	args = append(args, jsRuntimeArgs(dir)...)
+	args = append(args, jsRuntimeArgs()...)
 
 	// склейка видео+аудио идёт через ffmpeg из binDir, а не из PATH
 	if ff := ffmpegPath(dir); ff != "" {
@@ -383,11 +417,7 @@ func infoJSON(url string, playlist bool) (map[string]any, error) {
 	if err := ensureBins(); err != nil {
 		return nil, err
 	}
-	dir, err := binDir()
-	if err != nil {
-		return nil, err
-	}
-	ytdlp := filepath.Join(dir, "yt-dlp.exe")
+	ytdlp := ytdlpPath()
 
 	args := []string{"--no-warnings", "--ignore-config", "--dump-single-json"}
 	if playlist {
@@ -397,7 +427,7 @@ func infoJSON(url string, playlist bool) (map[string]any, error) {
 	// --no-playlist намеренно НЕ передаётся: yt-dlp сам различает ссылку на
 	// одно видео и на страницу с несколькими (один элемент → одно видео).
 	// Принудительный флаг молча урезал такие страницы до одного ролика.
-	args = append(args, jsRuntimeArgs(dir)...)
+	args = append(args, jsRuntimeArgs()...)
 	args = append(args, cookieArgs()...)
 	args = append(args, url)
 
@@ -450,14 +480,13 @@ func infoJSON(url string, playlist bool) (map[string]any, error) {
 
 // fetchTitle получает название клипа отдельным тихим вызовом (без скачивания).
 func fetchTitle(url string) (string, error) {
-	dir, err := binDir()
-	if err != nil {
+	if err := ensureBins(); err != nil {
 		return "", err
 	}
-	ytdlp := filepath.Join(dir, "yt-dlp.exe")
+	ytdlp := ytdlpPath()
 
 	args := []string{"--no-warnings", "--ignore-config", "--no-playlist", "--print", "title"}
-	args = append(args, jsRuntimeArgs(dir)...)
+	args = append(args, jsRuntimeArgs()...)
 	args = append(args, cookieArgs()...)
 	args = append(args, url)
 

@@ -25,6 +25,11 @@ type Config struct {
 	CookiesSpec    string `json:"cookies_spec"`
 	CookiesFile    string `json:"cookies_file"`
 	CookiesAck     bool   `json:"cookies_ack"` // предупреждение показано
+
+	// ComponentsURL — откуда тянутся yt-dlp/ffmpeg/deno. Пусто — работаем
+	// только с тем, что уже лежит на диске (portable-папка, кэш или вшитая
+	// в сборку копия). Требуется https.
+	ComponentsURL string `json:"components_url"`
 }
 
 var config = struct {

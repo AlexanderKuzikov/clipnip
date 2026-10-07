@@ -279,6 +279,54 @@ func newAPI() http.Handler {
 		}
 	})
 
+	// Статус компонентов: откуда взят каждый и что с ним не так.
+	mux.HandleFunc("/api/components", func(w http.ResponseWriter, r *http.Request) {
+		snapshot := func() map[string]any {
+			return map[string]any{
+				"url":        componentsBaseURL(),
+				"portable":   portableBinDir(),
+				"components": componentStates,
+				"ready":      componentsReady(requiredComponents()),
+				"missing":    missingComponents(requiredComponents()),
+				"problem":    componentsProblem,
+			}
+		}
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(w, http.StatusOK, snapshot())
+
+		case http.MethodPost:
+			var req struct {
+				URL     string `json:"url"`
+				Refresh bool   `json:"refresh"`
+			}
+			json.NewDecoder(r.Body).Decode(&req)
+			if u := strings.TrimSpace(req.URL); u != "" {
+				parsed, err := url.Parse(u)
+				if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+					writeJSON(w, http.StatusBadRequest, map[string]string{
+						"error": "Нужен полный https-адрес, например https://example.com/clipnip",
+					})
+					return
+				}
+				config.Lock()
+				config.ComponentsURL = strings.TrimRight(u, "/")
+				config.Unlock()
+				saveConfig()
+			}
+			// refresh=true — переподключиться сразу, без перезапуска:
+			// именно этот путь восстанавливает приложение, у которого сняли
+			// папку с компонентами
+			if req.Refresh {
+				ensureBins()
+			}
+			writeJSON(w, http.StatusOK, snapshot())
+
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
+		}
+	})
+
 	mux.HandleFunc("/api/settings", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:

@@ -43,10 +43,16 @@ func main() {
 	startWorkers()
 	startWatchdog()
 
+	// Недостающие компоненты не мешают старту: без них приложение поднимается
+	// и даёт починить себя в настройках. Фатальна только неисправимая ошибка
+	// самой распаковки.
 	if err := ensureBins(); err != nil {
 		log.Printf("bootstrap failed: %v", err)
 		fatalBox(err)
 		return
+	}
+	if componentsProblem != "" {
+		log.Printf("components incomplete: %s", componentsProblem)
 	}
 	if version, hasFFmpeg, hasDeno := probeEngine(); version != "" {
 		if version != ytdlpVersion {
