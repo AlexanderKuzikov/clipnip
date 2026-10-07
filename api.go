@@ -249,6 +249,36 @@ func newAPI() http.Handler {
 		})
 	})
 
+	// Хвост лога: диагностика не должна требовать захода в AppData.
+	mux.HandleFunc("/api/log", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			data, err := os.ReadFile(logFilePath())
+			if err != nil {
+				writeJSON(w, http.StatusOK, map[string]string{
+					"path": logFilePath(), "tail": "log is empty",
+				})
+				return
+			}
+			const maxTail = 24 * 1024
+			tail := string(data)
+			if len(tail) > maxTail {
+				tail = "...(truncated)...\n" + tail[len(tail)-maxTail:]
+			}
+			writeJSON(w, http.StatusOK, map[string]string{"path": logFilePath(), "tail": tail})
+
+		case http.MethodPost:
+			if err := openLogFile(); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
+		}
+	})
+
 	mux.HandleFunc("/api/settings", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
@@ -450,6 +480,7 @@ func newAPI() http.Handler {
 				job.Retries = 0
 				job.Stuck = false
 				job.FirstRetryAt = time.Time{}
+				job.RetryWait = 0
 				job.DownloadDir = dir
 				job.Force = req.Force
 			})
@@ -464,6 +495,7 @@ func newAPI() http.Handler {
 			return
 		}
 
+		persistQueue()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"job_id": id, "status": "queued", "existing": !createdNew, "resumed": hasPartial(dir, id),
 		})

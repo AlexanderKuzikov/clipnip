@@ -371,6 +371,159 @@ func TestJsRuntimeArgsPointsAtEmbeddedDeno(t *testing.T) {
 	}
 }
 
+// yt-dlp печатает сырые байты в секунду при скорости ниже 1 KiB/s;
+// без этой ветки парсер молча возвращал 0 и скорость не показывалась.
+func TestParseSpeedUnits(t *testing.T) {
+	cases := map[string]int64{
+		"512.00B/s":       512,
+		"1.00KiB/s":       1024,
+		"2.50MiB/s":       int64(2.5 * 1024 * 1024),
+		"1.5GiB/s":        int64(1.5 * 1024 * 1024 * 1024),
+		"1.00mib/s":       1024 * 1024,
+		"NA":              0,
+		"":                0,
+		"unknown garbage": 0,
+	}
+	for in, want := range cases {
+		if got := parseSpeed(in); got != want {
+			t.Errorf("parseSpeed(%q) = %d, want %d", in, got, want)
+		}
+	}
+}
+
+// При склейке yt-dlp качает видео и аудио отдельными файлами: счётчики
+// каждого начинаются с нуля. Проверяем накопление по компонентам.
+func TestMergedProgressAccumulates(t *testing.T) {
+	job := &Job{JobID: "m1", Status: "downloading", Stage: "downloading"}
+	feed := func(downloaded, total int64, speed string) {
+		job.set(func() {
+			if total > 0 {
+				if job.CurTotal > 0 && downloaded < job.CurDownloaded {
+					job.DoneTotal += job.CurTotal
+					job.CurDownloaded = 0
+				}
+				job.CurTotal = total
+				job.CurDownloaded = downloaded
+				job.Total = job.DoneTotal + job.CurTotal
+				job.Downloaded = job.DoneTotal + job.CurDownloaded
+			}
+			if v := parseSpeed(speed); v > 0 {
+				job.Speed = v
+			}
+		})
+	}
+
+	feed(50*1024*1024, 100*1024*1024, "1.00MiB/s") // видео на середине
+	if job.Downloaded != 50*1024*1024 || job.Total != 100*1024*1024 {
+		t.Fatalf("video component wrong: %d/%d", job.Downloaded, job.Total)
+	}
+
+	// старт второго компонента: счётчик откатился к нулю
+	feed(0, 0, "NA")
+	feed(1024*1024, 10*1024*1024, "NA") // аудио пошло
+	want := int64(100*1024*1024 + 1024*1024)
+	if job.Downloaded != want {
+		t.Errorf("aggregate downloaded = %d, want %d", job.Downloaded, want)
+	}
+	// после старта аудио итоговый total = видео + аудио
+	if job.Total != 110*1024*1024 {
+		t.Errorf("total = %d, want %d", job.Total, int64(110*1024*1024))
+	}
+
+	feed(10*1024*1024, 10*1024*1024, "NA") // аудио докачано
+	if job.Total != 110*1024*1024 {
+		t.Errorf("final total = %d, want %d", job.Total, int64(110*1024*1024))
+	}
+	if job.Downloaded != 110*1024*1024 {
+		t.Errorf("final downloaded = %d, want %d", job.Downloaded, int64(110*1024*1024))
+	}
+}
+
+func TestQueuePersistsAndRestores(t *testing.T) {
+	localDir := t.TempDir()
+	oldOverride := configDirOverride
+	configDirOverride = localDir
+	t.Cleanup(func() {
+		configDirOverride = oldOverride
+		jobs.Lock()
+		jobs.m = make(map[string]*Job)
+		jobs.Unlock()
+	})
+
+	id := jobID("https://youtu.be/abc123", "video", "137")
+	jobs.Lock()
+	jobs.m[id] = &Job{
+		JobID: id, URL: "https://youtu.be/abc123", Mode: "video", FormatID: "137",
+		Title: "Queued Clip", Status: "queued", Stage: "queued", DownloadDir: localDir,
+	}
+	jobs.Unlock()
+	persistQueue()
+
+	data, err := os.ReadFile(queueFilePath())
+	if err != nil {
+		t.Fatalf("queue file not written: %v", err)
+	}
+	if !strings.Contains(string(data), "Queued Clip") {
+		t.Errorf("queue file missing title: %s", data)
+	}
+
+	// Имитируем рестарт: память пуста, на диске осталась очередь
+	jobs.Lock()
+	jobs.m = make(map[string]*Job)
+	jobs.Unlock()
+	// очередь не должна переполниться от прошлых тестов
+	for len(jobQueue) > 0 {
+		<-jobQueue
+	}
+
+	restoreQueue()
+	restored := getJob(id)
+	if restored == nil {
+		t.Fatal("job not restored from queue file")
+	}
+	if restored.Title != "Queued Clip" || restored.FormatID != "137" || restored.Mode != "video" {
+		t.Errorf("restored job lost fields: %+v", restored)
+	}
+	if restored.Status != "queued" {
+		t.Errorf("restored status = %q, want queued", restored.Status)
+	}
+
+	// Терминальные джобы в файл очереди не попадают
+	restored.set(func() { restored.Status = "done" })
+	persistQueue()
+	if _, err := os.Stat(queueFilePath()); !os.IsNotExist(err) {
+		t.Errorf("empty queue must remove the file, stat err = %v", err)
+	}
+}
+
+func TestRestoreQueueSkipsGarbage(t *testing.T) {
+	localDir := t.TempDir()
+	oldOverride := configDirOverride
+	configDirOverride = localDir
+	t.Cleanup(func() { configDirOverride = oldOverride })
+
+	junk := `[{"url":"ftp://evil/x","mode":"video"},{"url":"https://ok.test/v","mode":"nonsense"}]`
+	if err := os.WriteFile(queueFilePath(), []byte(junk), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restoreQueue() // не должен паниковать и не должен ничего создать
+
+	jobs.Lock()
+	defer jobs.Unlock()
+	for id, j := range jobs.m {
+		if j.URL == "ftp://evil/x" || j.URL == "https://ok.test/v" {
+			t.Errorf("garbage entry must be skipped, got job %s", id)
+		}
+	}
+}
+
+func TestPartTTLIsNotTooShort(t *testing.T) {
+	// `.part` на паузе должен переживать выходные: 24 ч убивали докачку
+	if partTTL < 72*time.Hour {
+		t.Errorf("partTTL too short: %s", partTTL)
+	}
+}
+
 func TestPlaylistDetection(t *testing.T) {
 	cases := map[string]bool{
 		"https://www.youtube.com/playlist?list=PL7I7TsNvvxnN95A4teM8_Qn4-dbB0mz3l": true,

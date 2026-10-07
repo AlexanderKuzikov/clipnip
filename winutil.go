@@ -1,27 +1,61 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"syscall"
 	"unsafe"
 )
 
 var (
-	user32     = syscall.NewLazyDLL("user32.dll")
-	procMsgBox = user32.NewProc("MessageBoxW")
-	kernel32   = syscall.NewLazyDLL("kernel32.dll")
+	user32              = syscall.NewLazyDLL("user32.dll")
+	procMsgBox          = user32.NewProc("MessageBoxW")
+	kernel32            = syscall.NewLazyDLL("kernel32.dll")
 	procGetModuleHandle = kernel32.NewProc("GetModuleHandleW")
-	procLoadIcon = user32.NewProc("LoadIconW")
-	procSendMessage = user32.NewProc("SendMessageW")
+	procLoadIcon        = user32.NewProc("LoadIconW")
+	procSendMessage     = user32.NewProc("SendMessageW")
+	procCreateMutex     = kernel32.NewProc("CreateMutexW")
 )
 
+const errorAlreadyExists = 183
+
+// singleInstance держит именованный mutex на всё время жизни процесса.
+// Без него два запуска поднимают два пула воркеров на одну папку загрузки,
+// что даёт коллизии в `.part` и перепутанные статусы джобов.
+func singleInstance() (syscall.Handle, error) {
+	name, err := syscall.UTF16PtrFromString("Local\\ClipNip.SingleInstance")
+	if err != nil {
+		return 0, err
+	}
+	handle, _, err := procCreateMutex.Call(0, 0, uintptr(unsafe.Pointer(name)))
+	if handle == 0 {
+		return 0, err
+	}
+	if errno, ok := err.(syscall.Errno); ok && errno == errorAlreadyExists {
+		syscall.CloseHandle(syscall.Handle(handle))
+		return 0, errAlreadyRunning
+	}
+	return syscall.Handle(handle), nil
+}
+
+var errAlreadyRunning = errors.New("another ClipNip instance is already running")
+
+func openLogFile() error {
+	_, logName := filepath.Split(logFilePath())
+	if logName == "" {
+		logName = "clipnip.log"
+	}
+	return exec.Command("explorer", "/select,"+filepath.Join(localAppDataDir(), logName)).Start()
+}
+
 const (
-	wmSetIcon   = 0x0080
-	iconSmall   = 0
-	iconBig     = 1
+	wmSetIcon = 0x0080
+	iconSmall = 0
+	iconBig   = 1
 )
 
 // setWindowIcon ставит иконку приложения (ресурс #1 из exe) в заголовок окна
@@ -71,19 +105,15 @@ func webView2Installed() bool {
 }
 
 func setupLog() (*os.File, error) {
-	base, err := os.UserCacheDir()
-	if err != nil {
-		return nil, err
-	}
-	dir := filepath.Join(base, "clipnip")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
-	}
-	f, err := os.OpenFile(filepath.Join(dir, "clipnip.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(logFilePath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, err
 	}
 	return f, nil
+}
+
+func logFilePath() string {
+	return filepath.Join(localAppDataDir(), "clipnip.log")
 }
 
 func fatalBox(err error) {

@@ -758,6 +758,44 @@
       color: var(--error);
     }
 
+    .footer-actions {
+      margin-top: 4px;
+      display: flex;
+      gap: 12px;
+      justify-content: center;
+    }
+
+    .link-btn {
+      background: none;
+      border: none;
+      padding: 0;
+      font-family: 'PT Mono', monospace;
+      font-size: 0.68rem;
+      color: var(--muted);
+      letter-spacing: 0.05em;
+      text-decoration: underline;
+      cursor: pointer;
+    }
+
+    .link-btn:hover {
+      color: var(--fg);
+    }
+
+    .log-view {
+      margin-top: 10px;
+      max-height: 50vh;
+      overflow: auto;
+      background: #2b2a27;
+      color: #e6e2d9;
+      border-radius: 8px;
+      padding: 12px;
+      font-family: 'PT Mono', monospace;
+      font-size: 0.62rem;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
     @media (max-width: 500px) {
       .brand h1 {
         font-size: 3rem;
@@ -862,6 +900,10 @@
 
     <div class="footer" id="engineFooter">
       <span id="engineLine">checking engine…</span>
+      <div class="footer-actions">
+        <button class="link-btn" onclick="showLog()">Log</button>
+        <button class="link-btn" onclick="openLogFolder()">Open log file</button>
+      </div>
     </div>
   </div>
 
@@ -1133,6 +1175,36 @@
     }
 
     loadCookies();
+
+    async function showLog() {
+      if (document.getElementById('logModal')) return;
+      const back = document.createElement('div');
+      back.className = 'modal-backdrop';
+      back.id = 'logModal';
+      back.innerHTML = `
+        <div class="modal">
+          <h3>ClipNip log</h3>
+          <div class="log-view" id="logTail">loading…</div>
+          <div class="modal-actions">
+            <button class="settings-btn" onclick="closeLog()">Close</button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(back);
+      try {
+        const res = await fetch('/api/log', { cache: 'no-store' });
+        const d = await res.json();
+        document.getElementById('logTail').textContent = d.tail || '(empty)';
+      } catch (err) {
+        document.getElementById('logTail').textContent = err.message || 'failed to load';
+      }
+    }
+
+    function closeLog() { document.getElementById('logModal')?.remove(); }
+
+    async function openLogFolder() {
+      try { await fetch('/api/log', { method: 'POST', cache: 'no-store' }); } catch (e) { /* ignore */ }
+    }
 
     const dirInput = document.getElementById('dirInput');
     dirInput.addEventListener('change', applyDir);

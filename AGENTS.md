@@ -23,16 +23,18 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
   - `POST /api/download` — очередь (дедуп sha1 url|mode|format_id)
   - `GET /api/status/<id>`; `POST /api/cancel/<id>`; `GET /api/open/<id>`; `GET /api/file/<id>`
   - `GET/POST /api/settings` — папка загрузки (`download_dir` или `browse`: нативный диалог SHBrowseForFolderW)
-  - `POST /api/engine` — версия движка, наличие ffmpeg, флаг `stale`
+  - `POST /api/engine` — версия движка, наличие ffmpeg и deno, флаг `stale`
   - `POST /api/reach` — вердикт транспортной доступности домена
   - `GET/POST /api/cookies` — детект браузеров + настройка авторизации
   - `POST /api/cookies/test` — пробная авторизация (сухой `/api/info`)
+  - `GET /api/log` — хвост лога; `POST /api/log` — открыть файл в проводнике
   - При ошибке `/api/info` отдаёт `reach` + `reach_detail` (UI показывает их важнее текста yt-dlp)
 - `config.go` — конфиг в `%LOCALAPPDATA%\clipnip\config.json`; `download_dir` + cookies (`cookies_enabled`/`cookies_spec`/`cookies_file`/`cookies_ack`). `configDirOverride` — переопределение каталога конфига, используется тестами (`TestMain`), чтобы юнит-тесты не писали в реальный конфиг.
 - `cookies.go` — автодетект браузеров по путям из исходников yt-dlp, профили свежим первым; `cookieArgs()` для вызовов yt-dlp; `humanizeCookieError` (два задокументированных сбоя чтения cookies → человеческий язык). Спецификация = формат самого yt-dlp: `chrome`, `edge:Profile 1`, `chromium:C:\...\Default`.
 - `jobs.go` — джобы в памяти; **таксономия ошибок 5 классов** (`classifyError`): `throttle` / `engine` (extractor отработал, поток не отдали → движок устарел) / `site` (отказ сайта: бот-чек, нет авторизации) / `fatal` / `network`. `affectsParallelism` — только throttle+network режут пул и берут cooldown (30 с при 429); `retriable` — кроме engine и fatal; `errorHint` → actionable-текст в UI. Адаптивная параллельность (старт 8, потолок 10, пол 1; +1 за 15 успешных; ÷2 при throttle/network), очередь 1024 + приоритетная retryQueue; сетевой отказ → requeue с backoff 5с×N (до 2 повторов, потолок суммарно 90 с); watchdog 60 с без роста байтов → kill + error; кнопка Retry только для фатальных; чистка `.part` старше 24 ч; пропуск уже скачанных: перед стартом yt-dlp проверка `title` + расширение режима в папке загрузки → статус `skipped` (обход — флаг `force` в /api/download, «Download anyway»); имя файла — title из /api/info (фолбэк: fetchTitle, 15 c), переименование с защитой от коллизий `(1)`.
 - `ytdlp.go` — subprocess yt-dlp, прогресс-парсер, stall-детект (20 с без прогресса → kill+retry), распаковка из embed, kill-tree, `probeEngine()` (версия движка, кэш, вызывается из main и `/api/engine`). Плейлисты: `--flat-playlist --playlist-items 1-500`, таймаут 90 с. `--ignore-config` во всех трёх вызовах.
 - `netprobe.go` — `probeReach` (DNS + TCP:443), `probeReachAsync` (гонка с `/api/info`), `waitReach`, `envProxySet`. Вердикты: `ok` / `dns` / `tcp` / `proxy` / `unknown`.
+- `persist.go` — `queue.json` (состав очереди, не стейт-машина): `persistQueue` (вызывается из `defer` в `runDownload`, из `cancelJob` и при постановке в очередь), `restoreQueue` (до старта воркеров, с валидацией записей).
 - `embedded/*.gz` — gzip-архивы yt-dlp.exe, ffmpeg.exe и deno.exe, вшиты через `//go:embed`. Распаковка в `%LOCALAPPDATA%\clipnip\bin\` при первом запуске (ensureBins). yt-dlp и deno перезаписываются, только если их версия в константах `ytdlpVersion`/`denoVersion` не совпадает с маркером `*.ver`; ffmpeg не перезаписывается никогда (ручное обновление). Склейка видео+аудио идёт через `--ffmpeg-location` на binDir — ffmpeg в PATH не нужен.
 - `jsRuntimeArgs(dir)` — `--js-runtimes deno:<binDir>`; deno нужен для yt-dlp-ejs. **Проверено:** без него JS-рантайма на машине нет вообще (node/bun/quickjs отсутствуют), и при этом yt-dlp и так находит deno рядом со своим exe — флаг держим как страховку, а не как необходимое условие.
 
@@ -76,6 +78,10 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
 18. **`--no-playlist` больше не передаётся в `/api/info`** — yt-dlp сам различает одно видео и страницу с несколькими. Возврат флага тихо урежет не-YouTube страницу с несколькими роликами до одного. `--flat-playlist` — только для ссылок на плейлист YouTube.
 19. **Форматы: при равной высоте https-DASH предпочтительнее m3u8.** Наивный max tbr отдавал HLS (битрейт всегда выше), а у HLS `total_bytes` иногда NA — прогресс-бар терял точность.
 20. **deno не сжимается.** gzip даёт 42.6 MB из 97.5 MB, поэтому вшивание стоит ~42 MB и не имеет альтернативы: node/bun/quickjs на машине отсутствуют.
+21. **Канал yt-dlp — nightly, а не stable.** YouTube ломает player-клипы каждые несколько недель, фикс приезжает в master за дни, а сам README yt-dlp называет stable «склонным к внешним поломкам». Обоснование и риски — ADR 006 (там же поправка моего прежнего неверного довода).
+22. **При склейке счётчики считаются по компонентам.** Видео и аудио качаются отдельными файлами, каждый с нуля: начало нового компонента определяется откатом `downloaded_bytes`. В UI — `DoneTotal + Cur*`. Наивное «взять последний тик» показывало размер аудиофайла вместо готового ролика.
+23. **`msgBox` в headless висель вечно.** Модальное окно блокируется на клике, а интерактивного пользователя нет — в headless только лог (обнаружено на прогоне single-instance).
+24. **Очередь на диске — состав, а не состояние.** Формат файла при обновлении надо валидировать при восстановлении (мусорные URL и режимы отбрасываются).
 
 ## Места хранения
 

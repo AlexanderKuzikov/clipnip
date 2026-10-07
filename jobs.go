@@ -32,23 +32,33 @@ type Job struct {
 	Filename string
 	File     string
 
-	Downloaded int64
-	Total      int64
-	Speed      int64
-	ETA        int64
+	// Поля прогресса. Downloaded/Total — итог по всем компонентам (для UI),
+	// Cur*/DoneTotal — внутренний разбор склейки, где каждый компонент
+	// (видео, аудио) считается отдельно и с нуля. LastTick* — для
+	// расчёта скорости по дельте байтов, когда yt-dlp отдаёт NA.
+	Downloaded    int64
+	Total         int64
+	Speed         int64
+	ETA           int64
+	CurTotal      int64
+	CurDownloaded int64
+	DoneTotal     int64
+	LastTickAt    time.Time
+	LastTickBytes int64
 
 	// ErrorHint — короткая подсказка «что делать» по классу ошибки.
 	// Держим отдельно от Error (сырой текст yt-dlp), чтобы UI мог показать
 	// actionable-сообщение, не разбирая чужую строку в браузере.
 	ErrorHint string
 
-	Retries      int       // сетевые повторы (requeue)
-	NextRetryAt  time.Time // когда retry_wait → queued
-	FirstRetryAt time.Time // начало цепочки ретраев (для потолка retryTotalTimeout)
-	Running      bool      // защита от двойного запуска
-	Stuck        bool      // watchdog пометил зависшим (байты не растут)
-	LastDataAt   time.Time // последний рост downloaded_bytes
-	Force        bool      // одноразовый обход пропуска «уже скачано» (Download anyway)
+	Retries      int           // сетевые повторы (requeue)
+	NextRetryAt  time.Time     // когда retry_wait → queued
+	FirstRetryAt time.Time     // начало цепочки ретраев (для логов)
+	RetryWait    time.Duration // суммарное ожидание между попытками (потолок)
+	Running      bool          // защита от двойного запуска
+	Stuck        bool          // watchdog пометил зависшим (байты не растут)
+	LastDataAt   time.Time     // последний рост downloaded_bytes
+	Force        bool          // одноразовый обход пропуска «уже скачано» (Download anyway)
 
 	pidMu       sync.Mutex
 	pid         int
@@ -185,7 +195,8 @@ func acquire() {
 		if now.Before(adapt.cooldownUntil) {
 			wait := adapt.cooldownUntil.Sub(now)
 			adapt.Unlock()
-			log.Printf("parallel: cooldown %s", wait.Round(time.Second))
+			// лог переносится в adaptFailure (одна строка на смену
+			// cooldown), здесь каждый воркер писал бы свою — шум
 			time.Sleep(wait)
 			adapt.Lock()
 			continue
@@ -243,8 +254,10 @@ func adaptFailure(kind string) {
 	switch kind {
 	case errThrottle:
 		adapt.cooldownUntil = time.Now().Add(cooldown429)
+		log.Printf("parallel: -> %d (throttle, cooldown %s)", adapt.current, cooldown429)
+	default:
+		log.Printf("parallel: -> %d (failure: %s)", adapt.current, kind)
 	}
-	log.Printf("parallel: -> %d (failure: %s)", adapt.current, kind)
 	adapt.cond.Broadcast()
 }
 
@@ -346,12 +359,17 @@ func downloadsDir() (string, error) {
 	return dir, nil
 }
 
+// partTTL: `.part` живёт неделю. Раньше был 24 ч, из-за чего поставленная
+// на паузу загрузка большого файла терялась при возвращении через пару
+// дней — докачивать было нечего.
+const partTTL = 7 * 24 * time.Hour
+
 func cleanupStaleParts() {
 	dir, err := downloadsDir()
 	if err != nil {
 		return
 	}
-	cutoff := time.Now().Add(-24 * time.Hour)
+	cutoff := time.Now().Add(-partTTL)
 	matches, _ := filepath.Glob(filepath.Join(dir, "*.part"))
 	ytdlMatches, _ := filepath.Glob(filepath.Join(dir, "*.ytdl"))
 	matches = append(matches, ytdlMatches...)
@@ -568,12 +586,26 @@ func runDownload(job *Job) {
 	dir := job.DownloadDir
 	resumed := hasPartial(dir, job.JobID)
 
+	// очередь на диск обновляется при любом выходе из джобы: done, error,
+	// skipped, cancel, panic — все терминальные состояния одним хуком
+	defer persistQueue()
+
 	job.set(func() {
 		job.Status = "downloading"
 		job.Stage = "downloading"
 		job.Error = ""
 		job.Progress = 0
 		job.Resumed = resumed
+		job.Downloaded = 0
+		job.Total = 0
+		job.Speed = 0
+		job.ETA = 0
+		job.CurTotal = 0
+		job.CurDownloaded = 0
+		job.DoneTotal = 0
+		job.LastTickAt = time.Time{}
+		job.LastTickBytes = 0
+		job.LastDataAt = time.Time{}
 	})
 
 	if job.Title == "" {
@@ -615,9 +647,35 @@ func runDownload(job *Job) {
 			job.Status = "downloading"
 			job.Stage = "downloading"
 			job.Error = ""
-			job.Downloaded = st.Downloaded
-			job.Total = st.Total
-			job.Speed = parseSpeed(st.Speed)
+
+			// Склейка качает компоненты (видео, потом аудио) отдельными
+			// файлами: счётчики каждого начинаются с нуля. Без накопления
+			// карточка показывала размер последнего компонента вместо
+			// итогового. В Reported-поля идёт сумма завершённых
+			// компонентов (DoneTotal) плюс текущий.
+			if st.Total > 0 {
+				if job.CurTotal > 0 && st.Downloaded < job.CurDownloaded {
+					job.DoneTotal += job.CurTotal
+					job.CurDownloaded = 0
+				}
+				job.CurTotal = st.Total
+				job.CurDownloaded = st.Downloaded
+				job.Total = job.DoneTotal + job.CurTotal
+				job.Downloaded = job.DoneTotal + job.CurDownloaded
+			}
+
+			// Скорость: доверяем yt-dlp, но при NA (частый случай для HLS
+			// и быстрых файлов) считаем сами по дельте байтов.
+			if v := parseSpeed(st.Speed); v > 0 {
+				job.Speed = v
+			} else if !job.LastTickAt.IsZero() {
+				if dt := time.Since(job.LastTickAt).Seconds(); dt >= 1 && st.Downloaded >= job.LastTickBytes {
+					job.Speed = int64(float64(st.Downloaded-job.LastTickBytes) / dt)
+				}
+			}
+			job.LastTickAt = time.Now()
+			job.LastTickBytes = st.Downloaded
+
 			job.ETA = parseETA(st.ETA)
 			if st.Downloaded > 0 {
 				job.LastDataAt = time.Now()
@@ -707,16 +765,19 @@ func runDownload(job *Job) {
 			if job.FirstRetryAt.IsZero() {
 				job.FirstRetryAt = time.Now()
 			}
+			job.RetryWait += delay
 		})
 		if job.Status == "paused" {
 			return
 		}
-		// потолок суммарного времени в retry — иначе мёртвый джоб забивает retryQueue
+		// суммарное время именно в ожидании между попытками, а не «сколько
+		// прошло с первого ретрая»: иначе в метку попадало ожидание слота в
+		// retryQueue и джоб с двумя короткими ретраями выглядел как «13m»
 		job.mu.RLock()
-		first := job.FirstRetryAt
+		spent := job.RetryWait
 		job.mu.RUnlock()
-		if time.Since(first) > retryTotalTimeout {
-			log.Printf("retry timeout job=%s: spent %s in retry", job.JobID, time.Since(first).Round(time.Second))
+		if spent > retryTotalTimeout {
+			log.Printf("retry timeout job=%s: waited %s between attempts", job.JobID, spent.Round(time.Second))
 			job.set(func() {
 				job.Status = "error"
 				job.Stage = "error"
@@ -848,6 +909,11 @@ func parseSpeed(s string) int64 {
 	case strings.HasSuffix(s, "gib/s"):
 		mult = 1024 * 1024 * 1024
 		num = strings.TrimSpace(strings.TrimSuffix(s, "gib/s"))
+	case strings.HasSuffix(s, "b/s"):
+		// yt-dlp печатает сырые байты в секунду при скорости ниже 1 KiB/s —
+		// медленный старт, первый километр, забитый CDN. Без этой ветки
+		// скорость молча показывалась нулём.
+		num = strings.TrimSpace(strings.TrimSuffix(s, "b/s"))
 	default:
 		return 0
 	}
@@ -962,6 +1028,7 @@ func cancelJob(id string) bool {
 	killTreeOnCancel(job)
 	// отменил сам — хвост .part не нужен, убираем мусор
 	cleanupTempFiles(job.DownloadDir, id)
+	persistQueue()
 	return true
 }
 
@@ -995,6 +1062,7 @@ func resumeJob(id string) bool {
 	job.Error = ""
 	job.Stuck = false
 	job.FirstRetryAt = time.Time{}
+	job.RetryWait = 0
 	job.mu.Unlock()
 
 	select {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -19,8 +20,26 @@ func main() {
 	}
 	log.Printf("=== clipnip start ===")
 
+	// Два экземпляра делили бы одну папку загрузки: коллизии в `.part`
+	// и перепутанные статусы. Handle держим до конца процесса.
+	instance, err := singleInstance()
+	if err != nil {
+		if errors.Is(err, errAlreadyRunning) {
+			// в headless нет интерактивного пользователя — модальное окно
+			// нависнет навсегда, поэтому только лог
+			if !headless() {
+				msgBox("ClipNip", "ClipNip is already running.\n\nClose the existing window first.")
+			}
+			log.Printf("single instance: another instance already running, exiting")
+			return
+		}
+		log.Printf("single instance check failed: %v", err)
+	}
+	_ = instance
+
 	loadConfig()
 	cleanupStaleParts()
+	restoreQueue()
 	startWorkers()
 	startWatchdog()
 
