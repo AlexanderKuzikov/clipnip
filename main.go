@@ -65,8 +65,10 @@ func main() {
 		}
 		if !hasDeno {
 			log.Printf("engine: deno missing — some YouTube formats may be unavailable")
+		} else if v := componentVersion("deno.exe"); v != "" {
+			log.Printf("engine: deno %s", v)
 		} else {
-			log.Printf("engine: deno %s", denoVersion)
+			log.Printf("engine: deno present")
 		}
 	}
 

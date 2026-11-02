@@ -54,6 +54,15 @@ func binDir() (string, error) {
 		}
 		return binDirOverride, nil
 	}
+	// CLIPNIP_DATA делает headless-прогон полностью изолированным: иначе
+	// компоненты скачиваются в реальный кэш пользователя.
+	if data := strings.TrimSpace(os.Getenv("CLIPNIP_DATA")); data != "" {
+		dir := filepath.Join(data, "bin")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return "", err
+		}
+		return dir, nil
+	}
 	base, err := os.UserCacheDir()
 	if err != nil {
 		return "", err
@@ -84,6 +93,20 @@ func resetEngineProbe() {
 	engineInfo.ffmpeg = false
 	engineInfo.deno = false
 	engineInfo.Unlock()
+}
+
+// componentVersion читает маркер версии рядом с компонентом. Пусто, если
+// компонент взят из portable-папки или маркера нет.
+func componentVersion(name string) string {
+	p := componentPath(name)
+	if p == "" {
+		return ""
+	}
+	data, err := os.ReadFile(p + ".ver")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
 // probeEngine один раз спрашивает версию у движка (~1.5 с), результат кэшируется.

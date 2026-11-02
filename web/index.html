@@ -108,6 +108,56 @@
       letter-spacing: 0.03em;
     }
 
+    .folders-actions {
+      display: flex;
+      gap: 8px;
+    }
+
+    .folder-new {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 4px;
+    }
+
+    .folder-new[hidden] {
+      display: none;
+    }
+
+    .folder-new input {
+      width: 100%;
+      padding: 6px 8px;
+      border: 1.5px solid var(--card-border);
+      border-radius: 7px;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: 'PT Mono', monospace;
+      font-size: 0.72rem;
+      outline: none;
+    }
+
+    .folder-new input:focus {
+      border-color: var(--accent);
+    }
+
+    .folder-new-actions {
+      display: flex;
+      gap: 6px;
+    }
+
+    .folder-new-actions .settings-btn {
+      flex: 1;
+      padding: 6px 8px;
+      font-size: 0.66rem;
+    }
+
+    .folder-new-note {
+      min-height: 1em;
+      font-size: 0.62rem;
+      line-height: 1.4;
+      color: var(--error);
+    }
+
     .folder-tree {
       flex: 1;
       min-height: 0;
@@ -965,7 +1015,18 @@
     <aside class="folders">
       <div class="folders-head">
         <span>Save to</span>
-        <button class="link-btn" id="treeRefresh" title="Refresh folder list">refresh</button>
+        <span class="folders-actions">
+          <button class="link-btn" id="newFolderToggle" title="Create a folder here">new folder</button>
+          <button class="link-btn" id="treeRefresh" title="Refresh folder list">refresh</button>
+        </span>
+      </div>
+      <div class="folder-new" id="folderNew" hidden>
+        <input id="newFolderName" type="text" maxlength="120" spellcheck="false" autocomplete="off" placeholder="Folder name">
+        <div class="folder-new-actions">
+          <button class="settings-btn" id="newFolderCreate">Create</button>
+          <button class="settings-btn" id="newFolderCancel">Cancel</button>
+        </div>
+        <div class="folder-new-note" id="newFolderNote"></div>
       </div>
       <nav class="folder-tree" id="folderTree" aria-label="Folder navigation"></nav>
       <div class="folder-foot" id="folderPath">Loading folders…</div>
@@ -1161,24 +1222,25 @@
       if (node.expanded && !node.loaded) await loadChildren(node);
     }
 
+    async function persistDownloadDir(path) {
+      const res = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ download_dir: path }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) throw new Error(data.error || 'Could not use this folder');
+      downloadDir = data.download_dir || path;
+      document.getElementById('folderPath').textContent = downloadDir;
+    }
+
     async function selectDir(node) {
       if (node.isDrive) {
         await toggleExpand(node);
         return;
       }
       try {
-        const res = await fetch('/api/settings', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ download_dir: node.path }),
-        });
-        const data = await res.json();
-        if (!res.ok || data.error) {
-          document.getElementById('folderPath').textContent = 'Could not use this folder: ' + (data.error || 'failed');
-          return;
-        }
-        downloadDir = data.download_dir || node.path;
-        document.getElementById('folderPath').textContent = downloadDir;
+        await persistDownloadDir(node.path);
         if (!node.expanded) {
           node.expanded = true;
           if (!node.loaded) await loadChildren(node);
@@ -1187,6 +1249,61 @@
       } catch (err) {
         document.getElementById('folderPath').textContent = 'Could not use this folder: ' + err.message;
       }
+    }
+
+    function showNewFolderForm() {
+      const form = document.getElementById('folderNew');
+      const input = document.getElementById('newFolderName');
+      const note = document.getElementById('newFolderNote');
+      form.hidden = false;
+      note.textContent = '';
+      input.value = '';
+      input.focus();
+    }
+
+    function hideNewFolderForm() {
+      document.getElementById('folderNew').hidden = true;
+      document.getElementById('newFolderNote').textContent = '';
+    }
+
+    async function createFolder() {
+      const note = document.getElementById('newFolderNote');
+      const input = document.getElementById('newFolderName');
+      const name = input.value.trim();
+      if (!downloadDir) {
+        note.textContent = 'Choose a folder first';
+        return;
+      }
+      if (!name) {
+        note.textContent = 'Enter a folder name';
+        return;
+      }
+      note.textContent = '';
+      try {
+        const res = await fetch('/api/fs/mkdir', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ parent: downloadDir, name }),
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) {
+          note.textContent = data.error || 'Could not create folder';
+          return;
+        }
+        await persistDownloadDir(data.path);
+        hideNewFolderForm();
+        await reloadFolders();
+      } catch (err) {
+        note.textContent = err.message || 'Could not create folder';
+      }
+    }
+
+    async function reloadFolders() {
+      drives = [];
+      fsLoaded = false;
+      renderTree();
+      await loadDrives();
+      if (downloadDir) await revealPath(downloadDir);
     }
 
     function appendFolderNode(container, node) {
@@ -1276,12 +1393,22 @@
       renderTree();
     }
 
-    document.getElementById('treeRefresh').addEventListener('click', async () => {
-      drives = [];
-      fsLoaded = false;
-      renderTree();
-      await loadDrives();
-      if (downloadDir) await revealPath(downloadDir);
+    document.getElementById('treeRefresh').addEventListener('click', reloadFolders);
+    document.getElementById('newFolderToggle').addEventListener('click', () => {
+      const form = document.getElementById('folderNew');
+      if (form.hidden) showNewFolderForm();
+      else hideNewFolderForm();
+    });
+    document.getElementById('newFolderCreate').addEventListener('click', createFolder);
+    document.getElementById('newFolderCancel').addEventListener('click', hideNewFolderForm);
+    document.getElementById('newFolderName').addEventListener('keydown', e => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        createFolder();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        hideNewFolderForm();
+      }
     });
 
     loadSettings();

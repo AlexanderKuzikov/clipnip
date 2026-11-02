@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"io/fs"
 	"log"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -110,4 +112,74 @@ func handleFSList(w http.ResponseWriter, r *http.Request) {
 func skipSystemDir(name string) bool {
 	lower := strings.ToLower(name)
 	return lower == "$recycle.bin" || lower == "system volume information"
+}
+
+// Имена, которые Windows не даёт создать даже с расширением: CON, NUL,
+// COM1..COM9 и т.д. Проверяется база до расширения.
+var reservedFolderNames = map[string]bool{
+	"CON": true, "PRN": true, "AUX": true, "NUL": true,
+	"COM1": true, "COM2": true, "COM3": true, "COM4": true, "COM5": true,
+	"COM6": true, "COM7": true, "COM8": true, "COM9": true,
+	"LPT1": true, "LPT2": true, "LPT3": true, "LPT4": true, "LPT5": true,
+	"LPT6": true, "LPT7": true, "LPT8": true, "LPT9": true,
+}
+
+func validFolderName(name string) bool {
+	if name == "" || name == "." || name == ".." {
+		return false
+	}
+	if strings.HasPrefix(name, ".") {
+		// скрытые папки дерево всё равно не показывает
+		return false
+	}
+	if unsafeNameRe.MatchString(name) {
+		return false
+	}
+	if strings.HasSuffix(name, ".") || strings.HasSuffix(name, " ") {
+		return false
+	}
+	if utf8.RuneCountInString(name) > 120 {
+		return false
+	}
+	base := strings.ToUpper(strings.TrimSpace(strings.TrimSuffix(name, filepath.Ext(name))))
+	return !reservedFolderNames[base]
+}
+
+// handleFSMkdir создаёт одну папку внутри выбранной. Никаких вложенных
+// путей через имя: разделители запрещены, так что filepath.Join безопасен.
+func handleFSMkdir(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
+		return
+	}
+	var req struct {
+		Parent string `json:"parent"`
+		Name   string `json:"name"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request"})
+		return
+	}
+	parent := strings.TrimSpace(req.Parent)
+	name := strings.TrimSpace(req.Name)
+	if !filepath.IsAbs(parent) || !validFolderName(name) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid folder name"})
+		return
+	}
+	info, err := os.Stat(parent)
+	if err != nil || !info.IsDir() {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Parent folder not found"})
+		return
+	}
+	dest := filepath.Join(parent, name)
+	if _, err := os.Stat(dest); err == nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "A folder with this name already exists"})
+		return
+	}
+	if err := os.Mkdir(dest, 0o755); err != nil {
+		log.Printf("fs mkdir %s: %v", dest, err)
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Could not create folder: " + err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"path": dest})
 }

@@ -13,4 +13,8 @@ credentials*
 /clipnip-remote.exe
 /clipnip-portable.exe
 /clipnip-portable.zip
+/clipnip-v*.exe
+/clipnip-remote-v*.exe
+/clipnip-portable-v*.exe
+/clipnip-portable-v*.zip
 /clipnip-bin/

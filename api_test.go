@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1352,6 +1353,53 @@ func TestFSList(t *testing.T) {
 	handleFSList(badRec, bad)
 	if badRec.Code != http.StatusBadRequest {
 		t.Errorf("relative path must be rejected, got %d", badRec.Code)
+	}
+}
+
+func TestFSMkdir(t *testing.T) {
+	parent := t.TempDir()
+	post := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/fs/mkdir", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		handleFSMkdir(rec, req)
+		return rec
+	}
+
+	rec := post(`{"parent":` + strconv.Quote(parent) + `,"name":"New Folder"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(created.Path); err != nil || !info.IsDir() {
+		t.Fatalf("folder not created: %q (%v)", created.Path, err)
+	}
+
+	if got := post(`{"parent":` + strconv.Quote(parent) + `,"name":"New Folder"}`).Code; got != http.StatusConflict {
+		t.Errorf("duplicate must be 409, got %d", got)
+	}
+
+	for _, name := range []string{"", "..", ".hidden", "a/b", `a\\b`, "CON", "com1.txt", "bad:name", "trail."} {
+		body := `{"parent":` + strconv.Quote(parent) + `,"name":` + strconv.Quote(name) + `}`
+		if got := post(body).Code; got != http.StatusBadRequest {
+			t.Errorf("name %q must be rejected, got %d", name, got)
+		}
+	}
+	if got := post(`{"parent":"relative","name":"x"}`).Code; got != http.StatusBadRequest {
+		t.Errorf("relative parent must be rejected, got %d", got)
+	}
+	if got := post(`{"parent":` + strconv.Quote(filepath.Join(parent, "missing")) + `,"name":"x"}`).Code; got != http.StatusBadRequest {
+		t.Errorf("missing parent must be rejected, got %d", got)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/fs/mkdir", nil)
+	methodRec := httptest.NewRecorder()
+	handleFSMkdir(methodRec, req)
+	if methodRec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET must be 405, got %d", methodRec.Code)
 	}
 }
 

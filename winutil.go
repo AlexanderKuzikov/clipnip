@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"unsafe"
 )
@@ -27,8 +28,29 @@ const errorAlreadyExists = 183
 // singleInstance держит именованный mutex на всё время жизни процесса.
 // Без него два запуска поднимают два пула воркеров на одну папку загрузки,
 // что даёт коллизии в `.part` и перепутанные статусы джобов.
+// instanceMutexName — имя mutex. CLIPNIP_INSTANCE добавляет суффикс для
+// параллельного headless-прогона рядом с работающим GUI; использовать только
+// с отдельными CLIPNIP_DATA и папкой загрузки, иначе две копии подерутся.
+func instanceMutexName() string {
+	name := `Local\ClipNip.SingleInstance`
+	raw := strings.TrimSpace(os.Getenv("CLIPNIP_INSTANCE"))
+	if raw == "" {
+		return name
+	}
+	var suffix strings.Builder
+	for _, r := range raw {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			suffix.WriteRune(r)
+		}
+	}
+	if suffix.Len() == 0 {
+		return name
+	}
+	return name + "." + suffix.String()
+}
+
 func singleInstance() (syscall.Handle, error) {
-	name, err := syscall.UTF16PtrFromString("Local\\ClipNip.SingleInstance")
+	name, err := syscall.UTF16PtrFromString(instanceMutexName())
 	if err != nil {
 		return 0, err
 	}

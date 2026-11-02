@@ -50,10 +50,11 @@ install -m 664 "$TMP/yt-dlp.exe" "$DEST/yt-dlp.exe"
 cp -p "$DEST/yt-dlp.exe" "$DEST/yt-dlp.exe.$YT_TAG"
 
 # --- 2. ffmpeg: обновляем только если его нет ---
-# Качается BtbN master-latest, поэтому версия в манифесте — "master", а не
-# выдуманный номер: подпись "8.1.2" под master-сборкой вводила в заблуждение.
+# Качается BtbN master-latest, поэтому версия в манифесте берётся из маркера,
+# а не выдумывается: подпись "8.1.2" под master-сборкой вводила в заблуждение.
 # Версия informational, проверяется SHA-256.
 FFMPEG_VER=master
+FFMPEG_VER_FILE="$DEST/ffmpeg.exe.ver"
 if [ ! -f "$DEST/ffmpeg.exe" ]; then
     log "ffmpeg: файла нет, качаю essentials $FFMPEG_VER"
     curl -fL --max-time 1800 -o "$TMP/ffmpeg.zip" \
@@ -62,29 +63,43 @@ if [ ! -f "$DEST/ffmpeg.exe" ]; then
     unzip -o -j "$TMP/ffmpeg.zip" '*/bin/ffmpeg.exe' -d "$TMP" >/dev/null \
         || { log "FAIL: распаковка ffmpeg"; exit 1; }
     install -m 664 "$TMP/ffmpeg.exe" "$DEST/ffmpeg.exe"
+    printf '%s' "$FFMPEG_VER" > "$FFMPEG_VER_FILE"
 else
-    log "ffmpeg: уже на месте, версия $FFMPEG_VER, не трогаю"
+    log "ffmpeg: уже на месте, версия $(cat "$FFMPEG_VER_FILE" 2>/dev/null || echo unknown), не трогаю"
 fi
+FFMPEG_MANIFEST_VER=$(cat "$FFMPEG_VER_FILE" 2>/dev/null || echo "unknown")
 
 # --- 3. deno (необязательно) ---
 DENO_VER=2.9.8
+DENO_VER_FILE="$DEST/deno.exe.ver"
 if [ "$WITH_DENO" = "1" ]; then
-    if [ ! -f "$DEST/deno.exe" ]; then
+    # Маркер версии: без него обновление DENO_VER никогда не доезжало —
+    # проверялось только наличие файла.
+    if [ ! -f "$DEST/deno.exe" ] || [ "$(cat "$DENO_VER_FILE" 2>/dev/null)" != "$DENO_VER" ]; then
         log "deno: качаю $DENO_VER"
-        curl -fL --max-time 1800 -o "$TMP/deno.zip" \
-            "https://github.com/denoland/deno/releases/download/v$DENO_VER/deno-x86_64-pc-windows-msvc.zip" \
-            || log "WARN: deno не скачан — ClipNip справится и без него"
-        [ -f "$TMP/deno.zip" ] && unzip -o -j "$TMP/deno.zip" 'deno.exe' -d "$TMP" >/dev/null \
-            && install -m 664 "$TMP/deno.exe" "$DEST/deno.exe"
+        if curl -fL --max-time 1800 -o "$TMP/deno.zip" \
+            "https://github.com/denoland/deno/releases/download/v$DENO_VER/deno-x86_64-pc-windows-msvc.zip"; then
+            if unzip -o -j "$TMP/deno.zip" 'deno.exe' -d "$TMP" >/dev/null; then
+                install -m 664 "$TMP/deno.exe" "$DEST/deno.exe"
+                printf '%s' "$DENO_VER" > "$DENO_VER_FILE"
+            else
+                log "WARN: deno не распакован — ClipNip справится и без него"
+            fi
+        else
+            log "WARN: deno не скачан — ClipNip справится и без него"
+        fi
     fi
 fi
+# В манифест идёт фактическая версия, а не желаемая: если загрузка упала,
+# старый файл не должен выдаваться за новый.
+DENO_MANIFEST_VER=$(cat "$DENO_VER_FILE" 2>/dev/null || echo "unknown")
 
 # --- 4. манифест: хеши считаются по тому, что реально лежит в каталоге ---
 cd "$DEST" || exit 1
 {
     printf '{\n  "version": 1,\n  "components": [\n'
     first=1
-    for spec in "yt-dlp.exe:$YT_TAG" "ffmpeg.exe:$FFMPEG_VER" "deno.exe:$DENO_VER"; do
+    for spec in "yt-dlp.exe:$YT_TAG" "ffmpeg.exe:$FFMPEG_MANIFEST_VER" "deno.exe:$DENO_MANIFEST_VER"; do
         name=${spec%%:*}
         ver=${spec#*:}
         [ -f "$name" ] || continue

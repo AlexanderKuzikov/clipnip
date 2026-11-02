@@ -9,7 +9,7 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
 - build-portable: `go build -tags clipnipportable -ldflags="-s -w -H windowsgui" -o clipnip-portable.exe .` (**~7.6 МБ; сетевой загрузки нет вообще** — только `clipnip-bin` рядом с exe; собирается под ложные срабатывания антивирусов, ADR 012)
 - test: `go test ./...` (и `-tags clipnipremote` / `-tags clipnipportable` при правках embed)
 - vet: `go vet ./...`
-- headless-API: `$env:CLIPNIP_HEADLESS="1"; $env:CLIPNIP_PORT="8899"; $env:CLIPNIP_DATA="$env:TEMP\clipnip-data"; .\clipnip.exe` → `http://127.0.0.1:8899/` (через curl — Invoke-RestMethod на loopback падает из-за прокси). `CLIPNIP_DATA` уводит конфиг/очередь/лог из реального `%LOCALAPPDATA%\clipnip`.
+- headless-API: `$env:CLIPNIP_HEADLESS="1"; $env:CLIPNIP_PORT="8899"; $env:CLIPNIP_DATA="$env:TEMP\clipnip-data"; $env:CLIPNIP_INSTANCE="test"; .\clipnip.exe` → `http://127.0.0.1:8899/` (через curl — Invoke-RestMethod на loopback падает из-за прокси). `CLIPNIP_DATA` уводит конфиг/очередь/лог/кэш компонентов из реального `%LOCALAPPDATA%\clipnip`; `CLIPNIP_INSTANCE` даёт отдельный single-instance mutex, чтобы headless не конфликтовал с запущенным GUI. Без отдельной папки загрузки два экземпляра всё равно подерутся за файлы.
 
 ## Conventions
 
@@ -22,7 +22,7 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
 ## Structure
 
 - `main.go` — WebView + loopback-сервер; `CLIPNIP_PORT`/`CLIPNIP_HEADLESS` — для отладки.
-- `fs.go` — постоянная навигация по папкам (контракт из MuteNip): `GET /api/fs/drives` (локальные диски, без сетевых) и `GET /api/fs/list?path=` (ленивый список подпапок). UI — левая панель, выбор папки кликом сохраняет `download_dir`.
+- `fs.go` — постоянная навигация по папкам (контракт из MuteNip): `GET /api/fs/drives` (локальные диски, без сетевых), `GET /api/fs/list?path=` (ленивый список подпапок) и `POST /api/fs/mkdir` (создание одной папки; разделители, `.`/`..`, зарезервированные Windows-имена и хвостовые точки/пробелы отвергаются). UI — левая панель, выбор папки кликом сохраняет `download_dir`, кнопка `new folder` создаёт папку сразу в выбранной.
 - `noaudio.go` — режим `video_noaudio`: после скачивания проверяет наличие аудио через ffmpeg и при необходимости пересобирает файл `-map 0 -map -0:a -c copy` без перекодирования. Для video-only потока — no-op.
 - `api.go` — HTTP-контракт (унаследован от ReClip/app.py):
   - `POST /api/info` — метаданные + качества (таймаут 45 c)
@@ -104,13 +104,15 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
 27. **Манифест компонентов не грузить, если всё есть локально.** Portable-папка или встроенные копии — сеть не нужна; 10-секундный таймаут на старте из-за недоступного сервера недопустим.
 28. **Локальный API должен проверять Host и Origin.** Сторонняя страница могла text/plain POST без preflight переключить сервер компонентов (RCE) или поставить загрузку; DNS rebinding даёт совпадающие Origin/Host. См. `sameOrigin` в `api.go`.
 29. **Режим без звука нельзя делать только выбором формата.** У части сайтов единственный формат мультиплексный (X: `http-*` содержит аудио). Проверять ffmpeg и пересобирать `-map 0 -map -0:a -c copy`; имя — с суффиксом ` (no audio)`, иначе skip считает обычное видео уже скачанным.
-30. **Тесты пишут только в temp.** `CLIPNIP_DATA`/`configDirOverride` уводят конфиг, очередь и лог; без этого прогон затирал реальную очередь (`ftp://evil/x` находился в `%LOCALAPPDATA%`).
+30. **Тесты пишут только в temp.** `CLIPNIP_DATA`/`configDirOverride` уводят конфиг, очередь, лог и кэш компонентов; без этого прогон затирал реальную очередь (`ftp://evil/x` находился в `%LOCALAPPDATA%`).
+31. **Имя новой папки — trust boundary.** Проверять разделители, `.`/`..`, хвостовые точки/пробелы, зарезервированные Windows-имена (`CON`, `NUL`, `COM1`…) и длину; создавать только `os.Mkdir`, без вложенных путей. UI-ошибку показывать в inline-заметке, не алертом.
+32. **`CLIPNIP_INSTANCE` — только для тестовых прогонов.** Он снимает запрет второго экземпляра; обязательны отдельные `CLIPNIP_DATA` и папка загрузки, иначе две копии будут делить `.part` и статусы.
 
 ## Места хранения
 
 - Бинарники (распакованные): `%LOCALAPPDATA%\clipnip\bin\` (yt-dlp.exe, ffmpeg.exe, deno.exe) — сюда же ставятся компоненты, скачанные с сервера
 - Portable-режим: `<каталог exe>\clipnip-bin\` — приоритетнее кэша, сеть не нужна
-- Сервер компонентов: `https://clipnip.135.106.192.125.nip.io` (`manifest.json` + бинарники), адрес в конфиге `components_url`
+- Сервер компонентов: `https://clipnip.135.106.192.125.nip.io` (`manifest.json` + бинарники), адрес в конфиге `components_url`; сейчас yt-dlp 2026.10.29.232701, ffmpeg 8.1.2, deno 2.9.8
 - Конфиг: `%LOCALAPPDATA%\clipnip\config.json`
 - Очередь: `%LOCALAPPDATA%\clipnip\queue.json`
 - Скачанное: выбранная пользователем папка (по умолчанию `%USERPROFILE%\Downloads\ClipNip\`)

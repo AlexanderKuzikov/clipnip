@@ -368,6 +368,7 @@ func newAPI() http.Handler {
 	// диски и ленивый список подпапок, без модальных диалогов.
 	mux.HandleFunc("/api/fs/drives", handleFSDrives)
 	mux.HandleFunc("/api/fs/list", handleFSList)
+	mux.HandleFunc("/api/fs/mkdir", handleFSMkdir)
 
 	mux.HandleFunc("/api/settings", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
