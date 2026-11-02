@@ -4,7 +4,7 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
 
 ## Commands
 
-- build: `go build -ldflags="-s -w -H windowsgui" -o clipnip.exe .` (автономная сборка, ~107 МБ, всё внутри)
+- build: `go build -ldflags="-s -w -H windowsgui" -o clipnip.exe .` (автономная сборка, ~112 МБ, всё внутри)
 - build-remote: `go build -tags clipnipremote -ldflags="-s -w -H windowsgui" -o clipnip-remote.exe .` (**~8.1 МБ, ни одного встроенного PE**; компоненты — portable-папка / кэш / сервер)
 - build-portable: `go build -tags clipnipportable -ldflags="-s -w -H windowsgui" -o clipnip-portable.exe .` (**~7.6 МБ; сетевой загрузки нет вообще** — только `clipnip-bin` рядом с exe; собирается под ложные срабатывания антивирусов, ADR 012)
 - test: `go test ./...` (и `-tags clipnipremote` / `-tags clipnipportable` при правках embed)
@@ -53,7 +53,9 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
 `/usr/local/bin/update-clipnip-bins.sh` на `sat` (исходник — `scripts/`).
 Хеши пересчитываются там же, вручную ничего трогать не надо.
 
-Порядок ниже нужен только для **автономной** сборки (~107 МБ), где всё лежит
+Текущие вшитые версии: yt-dlp 2026.10.29.232701, deno 2.9.8, ffmpeg 8.1.2.
+
+Порядок ниже нужен только для **автономной** сборки (~112 МБ), где всё лежит
 внутри exe.
 
 1. Скачать свежие `yt-dlp.exe` (nightly, ADR 006), `ffmpeg.exe` (GitHub / gyan.dev) и `deno.exe` (релиз denoland/deno, ассет `deno-x86_64-pc-windows-msvc.zip`).

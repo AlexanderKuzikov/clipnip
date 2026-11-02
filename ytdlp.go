@@ -31,8 +31,8 @@ const (
 	// несколько недель, и фикс приезжает в master за дни. Обоснование и
 	// риски — ADR 006. Пути к архивам объявлены в bins_embedded.go /
 	// bins_thin.go: тонкие сборки ничего не вшивают.
-	ytdlpVersion = "2026.09.27.232945"
-	denoVersion  = "2.9.7"
+	ytdlpVersion = "2026.10.29.232701"
+	denoVersion  = "2.9.8"
 )
 
 type progressState struct {
@@ -148,8 +148,8 @@ type binSpec struct {
 // deno присутствует только в полной сборке: в облегчённой denoGz пуст, и
 // компонент пропускается целиком.
 var embeddedBins = []binSpec{
-	{"yt-dlp.exe", ytdlpGz, ytdlpVersion, "997c00e8f8ed91431b1ddaeeae519743602beb0b6df0903194a2632e57df1b31"},
-	{"deno.exe", denoGz, denoVersion, "e020f3e232bd16e33768dee528e5983349c962952051ced0a5d58ad42f5d9b33"},
+	{"yt-dlp.exe", ytdlpGz, ytdlpVersion, "738eb6db13e9f7887924c6857306999ff674ee4fa74cb38879ed8dacc1c137b6"},
+	{"deno.exe", denoGz, denoVersion, "924397800533d3eb0ed0c889b20ad70e18b970d93acd8135bc043f425e528266"},
 	{"ffmpeg.exe", ffmpegGz, "8.1.2", "1326dde4c84ff1f96fe6b8916c5bed29e163e9b5dccf995f6f3db069d143ec5e"},
 }
 
