@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -90,11 +91,17 @@ func restoreQueue() {
 
 	restored := 0
 	for _, e := range entries {
-		mode := orDefault(e.Mode, "video")
-		if !isAllowedURL(e.URL) || (mode != "video" && !audioModeRe.MatchString(mode)) {
+		mode := orDefault(e.Mode, modeVideo)
+		if !isAllowedURL(e.URL) || !validMode(mode) {
 			continue
 		}
-		id := jobID(e.URL, e.Mode, e.FormatID)
+		// Валидация и нормализация: пустой mode раньше сохранялся в Job как ""
+		// и уходил в default-ветку buildDownloadArgs, то есть в mp3_128.
+		formatID := strings.TrimSpace(e.FormatID)
+		if !isVideoMode(mode) || (formatID != "" && !formatIDRe.MatchString(formatID)) {
+			formatID = ""
+		}
+		id := jobID(e.URL, mode, formatID)
 
 		jobs.Lock()
 		_, exists := jobs.m[id]
@@ -103,8 +110,8 @@ func restoreQueue() {
 				JobID:       id,
 				URL:         e.URL,
 				Title:       e.Title,
-				Mode:        e.Mode,
-				FormatID:    e.FormatID,
+				Mode:        mode,
+				FormatID:    formatID,
 				Status:      "queued",
 				Stage:       "queued",
 				DownloadDir: dir,

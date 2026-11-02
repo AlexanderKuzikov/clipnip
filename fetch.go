@@ -119,20 +119,98 @@ type componentState struct {
 	SHA256  string `json:"sha256"`
 }
 
-var componentStates []componentState
+var (
+	componentsMu       sync.Mutex
+	componentStates    []componentState
+	componentsProblem  string
+	componentsResolved bool
+)
 
-// resolveComponents готовит компоненты к работе. Для каждого выбирается первый
-// доступный источник; скачивание происходит только если ничего не найдено.
-func resolveComponents(needed []string) error {
-	componentStates = nil
-	resolvedPaths.Lock()
-	resolvedPaths.m = map[string]string{}
-	resolvedPaths.Unlock()
+// componentsSnapshot отдаёт согласованную копию состояния для HTTP-слоя.
+// componentStates меняется только под componentsMu: раньше чтение и запись
+// шли параллельно, а resolve запускался из каждого воркера.
+func componentsSnapshot() ([]componentState, bool, []string, string) {
+	componentsMu.Lock()
+	defer componentsMu.Unlock()
+	states := append([]componentState(nil), componentStates...)
+	return states, componentsReadyLocked(requiredComponents()),
+		missingComponentsLocked(requiredComponents()), componentsProblem
+}
+
+func componentsProblemText() string {
+	componentsMu.Lock()
+	defer componentsMu.Unlock()
+	return componentsProblem
+}
+
+// ensureBins разрешает компоненты один раз за процесс. Повторные вызовы из
+// каждого скачивания больше не пересчитывают SHA-256 всех файлов и не ходят
+// за манифестом: это было и медленно, и небезопасно при параллельных воркерах.
+func ensureBins() error {
+	componentsMu.Lock()
+	defer componentsMu.Unlock()
+	if componentsResolved {
+		return nil
+	}
+	if err := resolveComponentsLocked(); err != nil {
+		return err
+	}
+	componentsResolved = true
+	return nil
+}
+
+// refreshComponents — явная перепроверка (кнопка Apply в настройках).
+// Сбрасывает кэш probeEngine, иначе /api/engine до перезапуска показывал бы
+// «движка нет», даже когда компоненты уже скачаны.
+func refreshComponents() error {
+	componentsMu.Lock()
+	defer componentsMu.Unlock()
+	componentsResolved = false
+	if err := resolveComponentsLocked(); err != nil {
+		return err
+	}
+	componentsResolved = true
+	resetEngineProbe()
+	return nil
+}
+
+// resolveComponentsLocked вызывается под componentsMu.
+func resolveComponentsLocked() error {
+	needed := append(requiredComponents(), optionalComponents()...)
 	base := componentsBaseURL()
 	portable := portableBinDir()
 
+	cache, err := binDir()
+	if err != nil {
+		return err
+	}
+	os.MkdirAll(cache, 0o755)
+
+	// Если portable-папка или встроенные копии содержат всё нужное, сеть не
+	// трогаем вообще: локальная поставка важнее свежести движка, а лишний
+	// десятисекундный таймаут манифеста на старте никому не нужен.
+	allLocal := portable != ""
+	if allLocal {
+		for _, name := range needed {
+			if _, err := os.Stat(filepath.Join(portable, name)); err != nil {
+				allLocal = false
+				break
+			}
+		}
+	}
+	if !allLocal {
+		allLocal = true
+		for _, name := range needed {
+			b, ok := embeddedByName(name)
+			if !ok || b.gz == "" {
+				allLocal = false
+				break
+			}
+		}
+	}
+
 	var mf *manifest
-	if base != "" {
+	if allowRemoteFetch && base != "" && !allLocal {
 		loaded, err := loadManifest(base)
 		if err != nil {
 			log.Printf("components: manifest unavailable: %v", err)
@@ -141,93 +219,131 @@ func resolveComponents(needed []string) error {
 		}
 	}
 
-	cache, err := binDir()
-	if err != nil {
-		return err
-	}
-	os.MkdirAll(cache, 0o755)
-
+	states := make([]componentState, 0, len(needed))
+	paths := make(map[string]string, len(needed))
 	for _, name := range needed {
-		st := componentState{Name: name}
+		st := resolveComponent(name, portable, cache, mf, base)
+		if st.Source != "absent" && st.Path != "" {
+			paths[name] = st.Path
+		}
+		states = append(states, st)
+	}
 
-		// 1. portable — доверяем как есть: это файлы рядом с exe, положенные
-		//    туда человеком вместе с приложением.
-		if portable != "" {
-			p := filepath.Join(portable, name)
-			if _, err := os.Stat(p); err == nil {
-				st.Source, st.Path = "portable", p
-				if sum, err := fileSHA256(p); err == nil {
-					st.SHA256 = sum
-				}
-				setComponentPath(name, st.Path)
-				componentStates = append(componentStates, st)
-				continue
-			}
-		}
+	resolvedPaths.Lock()
+	resolvedPaths.m = paths
+	resolvedPaths.Unlock()
 
-		// 2. встроенная копия (автономная сборка). При пустом gz компонент
-		//    этой сборкой не вшит — ветка пропускается целиком.
-		for _, b := range embeddedBins {
-			if b.name != name || b.gz == "" {
-				continue
-			}
-			dest := filepath.Join(cache, name)
-			if b.sha256 != "" {
-				if sum, err := fileSHA256(dest); err == nil && sum == b.sha256 {
-					st.Source, st.Path, st.SHA256, st.Version = "cache", dest, sum, b.version
-					break
-				}
-				// кэша нет или он не совпадает — распаковываем из embed
-				if err := extractEmbedded(cache, b); err != nil {
-					log.Printf("components: %s extract failed: %v", name, err)
-					break
-				}
-				st.Source, st.Path, st.SHA256, st.Version = "embed", dest, b.sha256, b.version
-				break
-			}
-			if _, err := os.Stat(dest); err == nil {
-				st.Source, st.Path = "cache", dest
-				break
-			}
+	componentStates = states
+	if missing := missingComponentsLocked(requiredComponents()); len(missing) > 0 {
+		how := "Положите их в папку clipnip-bin рядом с exe"
+		if allowRemoteFetch {
+			how = "Укажите адрес сервера в настройках или положите их в папку clipnip-bin рядом с exe"
 		}
-		if st.Source != "" {
-			setComponentPath(name, st.Path)
-			componentStates = append(componentStates, st)
-			continue
-		}
-
-		// 3. сервер: нужен манифест с хешем, иначе качать нечего —
-		//    принять исполняемый файл без проверки нельзя.
-		if mf == nil {
-			componentStates = append(componentStates, st) // absent
-			continue
-		}
-		mc, ok := mf.find(name)
-		if !ok {
-			log.Printf("components: %s is not in the manifest", name)
-			setComponentPath(name, st.Path)
-			componentStates = append(componentStates, st)
-			continue
-		}
-		dest := filepath.Join(cache, name)
-		if sum, err := fileSHA256(dest); err == nil && sum == mc.SHA256 {
-			st.Source, st.Path, st.SHA256, st.Version = "cache", dest, sum, mc.Version
-			setComponentPath(name, st.Path)
-			componentStates = append(componentStates, st)
-			continue
-		}
-		if err := downloadComponent(base, mc, dest); err != nil {
-			log.Printf("components: %s download failed: %v", name, err)
-			setComponentPath(name, st.Path)
-			componentStates = append(componentStates, st)
-			continue
-		}
-		log.Printf("components: %s %s downloaded from %s", name, mc.Version, base)
-		st.Source, st.Path, st.SHA256, st.Version = "download", dest, mc.SHA256, mc.Version
-		setComponentPath(name, st.Path)
-		componentStates = append(componentStates, st)
+		componentsProblem = "Не удалось получить компоненты: " + strings.Join(missing, ", ") + ". " + how
+		log.Printf("components: %s", componentsProblem)
+	} else {
+		componentsProblem = ""
 	}
 	return nil
+}
+
+func embeddedByName(name string) (binSpec, bool) {
+	for _, b := range embeddedBins {
+		if b.name == name {
+			return b, true
+		}
+	}
+	return binSpec{}, false
+}
+
+// resolveComponent выбирает источник по порядку: portable → встроенная копия →
+// кэш/сервер. Пустой Source означает, что компонента нет.
+func resolveComponent(name, portable, cache string, mf *manifest, base string) componentState {
+	st := componentState{Name: name}
+	cacheTrusted := true
+
+	// 1. portable — доверяем как есть: это файлы рядом с exe, положенные
+	//    туда человеком вместе с приложением.
+	if portable != "" {
+		p := filepath.Join(portable, name)
+		if _, err := os.Stat(p); err == nil {
+			st.Source, st.Path = "portable", p
+			if sum, err := fileSHA256(p); err == nil {
+				st.SHA256 = sum
+			}
+			return st
+		}
+	}
+
+	// 2. встроенная копия (автономная сборка). При пустом gz компонент
+	//    этой сборкой не вшит — ветка пропускается целиком.
+	if b, ok := embeddedByName(name); ok && b.gz != "" {
+		dest := filepath.Join(cache, name)
+		if b.sha256 != "" {
+			if sum, err := fileSHA256(dest); err == nil && sum == b.sha256 {
+				st.Source, st.Path, st.SHA256, st.Version = "cache", dest, sum, b.version
+				return st
+			}
+			if err := extractEmbedded(cache, b); err == nil {
+				st.Source, st.Path, st.SHA256, st.Version = "embed", dest, b.sha256, b.version
+				return st
+			}
+			// Встроенная копия — эталон. Если распаковать не удалось, кэш с
+			// несовпавшим хешем доверять нельзя: только сервер может исправить.
+			cacheTrusted = false
+			log.Printf("components: %s extract failed, falling back to cache/server", name)
+		} else if _, err := os.Stat(dest); err == nil {
+			st.Source, st.Path = "cache", dest
+			if sum, err := fileSHA256(dest); err == nil {
+				st.SHA256 = sum
+			}
+			return st
+		}
+	}
+
+	// portable-сборка не использует ни кэш, ни сервер: только папка рядом.
+	if !allowRemoteFetch {
+		return st
+	}
+
+	dest := filepath.Join(cache, name)
+
+	// 3. сервер: нужен манифест с хешем, иначе качать нечего — принять
+	//    исполняемый файл без проверки нельзя. Если манифеста нет, но файл
+	//    уже лежит в кэше, работаем офлайн: он был проверен при установке.
+	if mf != nil {
+		if mc, ok := mf.find(name); ok {
+			if sum, err := fileSHA256(dest); err == nil && sum == mc.SHA256 {
+				st.Source, st.Path, st.SHA256, st.Version = "cache", dest, sum, mc.Version
+				return st
+			}
+			if err := downloadComponent(base, mc, dest); err == nil {
+				log.Printf("components: %s %s downloaded from %s", name, mc.Version, base)
+				st.Source, st.Path, st.SHA256, st.Version = "download", dest, mc.SHA256, mc.Version
+				return st
+			} else {
+				log.Printf("components: %s download failed: %v", name, err)
+			}
+			if _, err := os.Stat(dest); err == nil && cacheTrusted {
+				st.Source, st.Path, st.Version = "cache", dest, mc.Version
+				if sum, err := fileSHA256(dest); err == nil {
+					st.SHA256 = sum
+				}
+				return st
+			}
+			return st
+		}
+		log.Printf("components: %s is not in the manifest", name)
+	}
+
+	if _, err := os.Stat(dest); err == nil && cacheTrusted {
+		st.Source, st.Path = "cache", dest
+		if sum, err := fileSHA256(dest); err == nil {
+			st.SHA256 = sum
+		}
+		return st
+	}
+	return st
 }
 
 func (m *manifest) find(name string) (manifestComponent, bool) {
@@ -239,8 +355,16 @@ func (m *manifest) find(name string) (manifestComponent, bool) {
 	return manifestComponent{}, false
 }
 
+// manifestFetchTimeout — короткий таймаут: манифест нужен на старте, и
+// недоступный сервер не должен задерживать запуск на полминуты.
+const manifestFetchTimeout = 10 * time.Second
+
 func loadManifest(base string) (*manifest, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
+	ref, err := url.Parse(base)
+	if err != nil || ref.Scheme != "https" || ref.Host == "" {
+		return nil, fmt.Errorf("components URL must be https")
+	}
+	client := &http.Client{Timeout: manifestFetchTimeout}
 	resp, err := client.Get(base + "/manifest.json")
 	if err != nil {
 		return nil, err
@@ -254,15 +378,25 @@ func loadManifest(base string) (*manifest, error) {
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&mf); err != nil {
 		return nil, err
 	}
-	if mf.Version != manifestVersion {
-		return nil, fmt.Errorf("unsupported manifest version %d", mf.Version)
-	}
-	for _, c := range mf.Components {
-		if c.Name == "" || c.File == "" || len(c.SHA256) != 64 {
-			return nil, fmt.Errorf("malformed manifest entry for %q", c.Name)
-		}
+	if err := validateManifest(&mf); err != nil {
+		return nil, err
 	}
 	return &mf, nil
+}
+
+func validateManifest(mf *manifest) error {
+	if mf.Version != manifestVersion {
+		return fmt.Errorf("unsupported manifest version %d", mf.Version)
+	}
+	for _, c := range mf.Components {
+		if c.Name == "" || c.File == "" {
+			return fmt.Errorf("malformed manifest entry for %q", c.Name)
+		}
+		if raw, err := hex.DecodeString(c.SHA256); err != nil || len(raw) != 32 {
+			return fmt.Errorf("malformed manifest entry for %q", c.Name)
+		}
+	}
+	return nil
 }
 
 // downloadComponent кладёт файл в кэш атомарно: сначала во временный, затем
@@ -305,11 +439,23 @@ func fetchAndVerify(client *http.Client, fileURL, dest string, mc manifestCompon
 		return err
 	}
 	h := sha256.New()
-	_, err = io.Copy(io.MultiWriter(out, h), resp.Body)
-	out.Close()
+	// Размер из манифеста не даёт серверу заполнить диск бесконечным потоком;
+	// +1 байт — чтобы отличить «ровно Size» от «больше Size».
+	var body io.Reader = resp.Body
+	if mc.Size > 0 {
+		body = io.LimitReader(resp.Body, mc.Size+1)
+	}
+	n, err := io.Copy(io.MultiWriter(out, h), body)
+	if closeErr := out.Close(); err == nil {
+		err = closeErr
+	}
 	if err != nil {
 		os.Remove(tmp)
 		return err
+	}
+	if mc.Size > 0 && n > mc.Size {
+		os.Remove(tmp)
+		return fmt.Errorf("component is larger than the manifest says: %d > %d", n, mc.Size)
 	}
 	if got := hex.EncodeToString(h.Sum(nil)); got != mc.SHA256 {
 		// несовпадение не оставляет ни файла, ни временного мусора
@@ -327,6 +473,12 @@ func fetchAndVerify(client *http.Client, fileURL, dest string, mc manifestCompon
 
 // componentsReady — все нужные компоненты на месте.
 func componentsReady(needed []string) bool {
+	componentsMu.Lock()
+	defer componentsMu.Unlock()
+	return componentsReadyLocked(needed)
+}
+
+func componentsReadyLocked(needed []string) bool {
 	for _, n := range needed {
 		found := false
 		for _, st := range componentStates {
@@ -344,6 +496,12 @@ func componentsReady(needed []string) bool {
 
 // missingComponents — чего не хватает, для сообщения пользователю.
 func missingComponents(needed []string) []string {
+	componentsMu.Lock()
+	defer componentsMu.Unlock()
+	return missingComponentsLocked(needed)
+}
+
+func missingComponentsLocked(needed []string) []string {
 	var out []string
 	for _, n := range needed {
 		found := false

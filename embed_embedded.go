@@ -1,4 +1,4 @@
-//go:build !clipnipremote
+//go:build !clipnipremote && !clipnipportable
 
 package main
 

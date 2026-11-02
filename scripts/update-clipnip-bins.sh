@@ -1,7 +1,7 @@
 #!/bin/bash
 # Обновление компонентов ClipNip на сервере sat и пересчёт манифеста.
-# Раньше смена версии yt-dlp требовала пересборки ClipNip (101 МБ exe) и
-# перераздачи его всем пользователям. Теперь exe 7.6 МБ без PE внутри, а движок
+# Раньше смена версии yt-dlp требовала пересборки ClipNip (~107 МБ exe) и
+# перераздачи его всем пользователям. Теперь exe ~8 МБ без PE внутри, а движок
 # обновляется здесь: скрипт кладёт свежие бинарники и переписывает manifest.json.
 # Клиент сверяет SHA-256 и отказывается ставить файл при расхождении.
 #
@@ -45,13 +45,15 @@ curl -fL --max-time 900 -o "$TMP/yt-dlp.exe" \
     || { log "FAIL: скачивание yt-dlp"; exit 1; }
 
 # yt-dlp.exe не переносит версию в имя файла, поэтому она живёт в манифесте.
+# Копия под версионным именем нужна ротации: иначе старые сборки нечего чистить.
 install -m 664 "$TMP/yt-dlp.exe" "$DEST/yt-dlp.exe"
+cp -p "$DEST/yt-dlp.exe" "$DEST/yt-dlp.exe.$YT_TAG"
 
 # --- 2. ffmpeg: обновляем только если его нет ---
-# Сборки essentials с gyan.dev лежат на GitHub в releases BtbN/FFmpeg-Builds.
-# Версия фиксируется строкой ниже — меняй при желании, версия в манифесте
-# только informational, проверяется SHA-256.
-FFMPEG_VER=8.1.2
+# Качается BtbN master-latest, поэтому версия в манифесте — "master", а не
+# выдуманный номер: подпись "8.1.2" под master-сборкой вводила в заблуждение.
+# Версия informational, проверяется SHA-256.
+FFMPEG_VER=master
 if [ ! -f "$DEST/ffmpeg.exe" ]; then
     log "ffmpeg: файла нет, качаю essentials $FFMPEG_VER"
     curl -fL --max-time 1800 -o "$TMP/ffmpeg.zip" \
@@ -65,7 +67,7 @@ else
 fi
 
 # --- 3. deno (необязательно) ---
-DENO_VER=2.9.7
+DENO_VER=2.9.8
 if [ "$WITH_DENO" = "1" ]; then
     if [ ! -f "$DEST/deno.exe" ]; then
         log "deno: качаю $DENO_VER"

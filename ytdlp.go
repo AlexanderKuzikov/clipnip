@@ -30,7 +30,7 @@ const (
 	// Канал — nightly, а не stable: YouTube ломает player-клипы каждые
 	// несколько недель, и фикс приезжает в master за дни. Обоснование и
 	// риски — ADR 006. Пути к архивам объявлены в bins_embedded.go /
-	// bins_remote.go: сборка clipnipremote ничего не вшивает.
+	// bins_thin.go: тонкие сборки ничего не вшивают.
 	ytdlpVersion = "2026.09.27.232945"
 	denoVersion  = "2.9.7"
 )
@@ -74,6 +74,17 @@ var engineInfo = struct {
 	deno    bool
 	done    bool
 }{}
+
+// resetEngineProbe сбрасывает кэш версии. Нужен после того, как компоненты
+// появились или обновились: иначе UI до перезапуска видит «движка нет».
+func resetEngineProbe() {
+	engineInfo.Lock()
+	engineInfo.done = false
+	engineInfo.version = ""
+	engineInfo.ffmpeg = false
+	engineInfo.deno = false
+	engineInfo.Unlock()
+}
 
 // probeEngine один раз спрашивает версию у движка (~1.5 с), результат кэшируется.
 func probeEngine() (string, bool, bool) {
@@ -144,28 +155,8 @@ func optionalComponents() []string {
 	return []string{"deno.exe"}
 }
 
-// componentsProblem — человеческое описание того, чего не хватает, или "".
-var componentsProblem string
-
-// ensureBins готовит компоненты к работе: portable-папка → кэш → сервер.
-//
-// Недостающие компоненты НЕ фатальны: приложение обязано подняться, чтобы
-// пользователь мог зайти в настройки и указать адрес сервера. Фатальная
-// ошибка тут означала бы «зайди в настройки» из окна, которого нет.
-func ensureBins() error {
-	needed := append(requiredComponents(), optionalComponents()...)
-	if err := resolveComponents(needed); err != nil {
-		return err
-	}
-	if missing := missingComponents(requiredComponents()); len(missing) > 0 {
-		componentsProblem = "Не удалось получить компоненты: " + strings.Join(missing, ", ") +
-			". Укажите адрес сервера в настройках или положите их в папку clipnip-bin рядом с exe"
-		log.Printf("components: %s", componentsProblem)
-	} else {
-		componentsProblem = ""
-	}
-	return nil
-}
+// ensureBins и componentsProblem живут в fetch.go: резолв компонентов —
+// это одна операция на процесс, а не часть каждого запуска yt-dlp.
 
 // extractEmbedded распаковывает бинарник и проверяет SHA-256 результата.
 // Пустой gz означает «компонент не вшит в эту сборку» — пропускаем.
@@ -210,7 +201,9 @@ func extractEmbedded(dir string, b binSpec) error {
 	}
 	h := sha256.New()
 	_, err = io.Copy(io.MultiWriter(out, h), zr)
-	out.Close()
+	if closeErr := out.Close(); err == nil {
+		err = closeErr
+	}
 	if err != nil {
 		os.Remove(tmp)
 		return err
@@ -222,6 +215,7 @@ func extractEmbedded(dir string, b binSpec) error {
 		}
 	}
 	if err := os.Rename(tmp, dest); err != nil {
+		os.Remove(tmp)
 		return err
 	}
 	if b.version != "" {
@@ -263,9 +257,38 @@ func ffmpegPath(dir string) string {
 
 var errStripRe = regexp.MustCompile(`(?m)^ERROR:\s*`)
 
+// isPostprocessActivity — строки, которые yt-dlp печатает во время склейки,
+// ремукса и извлечения звука. Прогресса в них нет, но процесс жив.
+func isPostprocessActivity(line string) bool {
+	for _, prefix := range []string{
+		"[Merger]", "[ExtractAudio]", "[VideoConvertor]", "[VideoRemuxer]",
+		"[FixupM3u8]", "[FixupM4a]", "[FixupTimestamp]", "[Metadata]",
+		"[EmbedThumbnail]", "[EmbedSubtitle]", "[MoveFiles]", "[SubtitlesConvertor]",
+	} {
+		if strings.HasPrefix(line, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 var progressTemplate = "download:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s"
 
 const stallTimeout = 20 * time.Second
+
+// errComponentsMissing — понятная ошибка вместо «файл не найден» из exec,
+// которую классификатор принимал за сетевой сбой и ретраил.
+var errComponentsMissing = errors.New("engine components are missing — open settings or put them into the clipnip-bin folder next to the exe")
+
+func requireComponents() error {
+	if err := ensureBins(); err != nil {
+		return err
+	}
+	if !componentsReady(requiredComponents()) {
+		return errComponentsMissing
+	}
+	return nil
+}
 
 func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 	dir, err := binDir()
@@ -273,7 +296,7 @@ func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 		return err
 	}
 	// самовосстановление: антивирус мог удалить бинарники
-	if err := ensureBins(); err != nil {
+	if err := requireComponents(); err != nil {
 		return err
 	}
 	ytdlp := ytdlpPath()
@@ -346,6 +369,12 @@ func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 
 	for scanner.Scan() {
 		line := scanner.Text()
+		// Склейка и извлечение звука не печатают прогресс-строк, но это
+		// нормальная работа, а не зависание: иначе watchdog убивал ffmpeg
+		// на большом файле и загрузка уходила в бесконечный retry.
+		if isPostprocessActivity(line) {
+			lastProgress.Store(time.Now().UnixNano())
+		}
 		parts := strings.Split(line, "|")
 		if len(parts) == 5 && strings.Contains(parts[0], "%") {
 			st := progressState{
@@ -387,11 +416,18 @@ func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 	return err
 }
 
-type limitedBuffer struct{ buf []byte }
+// limitedBuffer держит хвост вывода. Мьютекс обязателен: в runYtDlp в него
+// пишут одновременно горутина os/exec (stderr) и основной цикл разбора stdout.
+type limitedBuffer struct {
+	mu  sync.Mutex
+	buf []byte
+}
 
 // Write держит ХВОСТ вывода: реальные ошибки yt-dlp приходят в конце,
 // а первые 4КБ обычно съедает stdout-шум.
 func (b *limitedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.buf = append(b.buf, p...)
 	if len(b.buf) > 8192 {
 		b.buf = b.buf[len(b.buf)-4096:]
@@ -399,7 +435,11 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (b *limitedBuffer) String() string { return string(b.buf) }
+func (b *limitedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(b.buf)
+}
 
 func parseNAInt(s string) int64 {
 	s = strings.TrimSpace(s)
@@ -414,7 +454,7 @@ func parseNAInt(s string) int64 {
 }
 
 func infoJSON(url string, playlist bool) (map[string]any, error) {
-	if err := ensureBins(); err != nil {
+	if err := requireComponents(); err != nil {
 		return nil, err
 	}
 	ytdlp := ytdlpPath()
@@ -480,7 +520,7 @@ func infoJSON(url string, playlist bool) (map[string]any, error) {
 
 // fetchTitle получает название клипа отдельным тихим вызовом (без скачивания).
 func fetchTitle(url string) (string, error) {
-	if err := ensureBins(); err != nil {
+	if err := requireComponents(); err != nil {
 		return "", err
 	}
 	ytdlp := ytdlpPath()

@@ -4,6 +4,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; img-src 'self' https: http: data:; font-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'">
   <title>ClipNip — Free Youtube Downloader</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <style>
@@ -64,10 +66,123 @@
       background-size: 128px;
     }
 
-    .page {
-      max-width: 620px;
+    .layout {
+      max-width: 960px;
       margin: 0 auto;
       padding: 20px 24px 48px;
+      display: flex;
+      gap: 18px;
+      align-items: flex-start;
+    }
+
+    .page {
+      flex: 1;
+      min-width: 0;
+      max-width: 620px;
+      margin: 0;
+      padding: 0;
+    }
+
+    .folders {
+      width: 250px;
+      flex: none;
+      position: sticky;
+      top: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      max-height: calc(100vh - 40px);
+      padding: 10px;
+      background: var(--card);
+      border: 1.5px solid var(--card-border);
+      border-radius: var(--radius);
+    }
+
+    .folders-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      padding: 2px 4px;
+      font-size: 0.72rem;
+      color: var(--muted);
+      letter-spacing: 0.03em;
+    }
+
+    .folder-tree {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+    }
+
+    .folder-item {
+      display: grid;
+      grid-template-columns: 16px minmax(0, 1fr);
+      align-items: center;
+      gap: 4px;
+      padding: 4px 6px 4px calc(6px + var(--depth) * 14px);
+      border-radius: 7px;
+    }
+
+    .folder-item:hover {
+      background: #f7f4ee;
+    }
+
+    .folder-item.active {
+      background: rgba(232, 93, 42, 0.1);
+    }
+
+    .folder-item.active .folder-label {
+      color: var(--accent);
+      font-weight: 600;
+    }
+
+    .folder-arrow {
+      width: 16px;
+      padding: 0;
+      border: none;
+      background: none;
+      color: var(--muted);
+      font-family: inherit;
+      font-size: 0.66rem;
+      line-height: 1;
+      cursor: pointer;
+    }
+
+    .folder-arrow:hover {
+      color: var(--fg);
+    }
+
+    .folder-label {
+      min-width: 0;
+      padding: 0;
+      border: none;
+      background: none;
+      text-align: left;
+      font: inherit;
+      font-size: 0.78rem;
+      color: var(--fg);
+      cursor: pointer;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .folder-msg {
+      padding: 3px 6px;
+      font-size: 0.7rem;
+      color: var(--muted);
+    }
+
+    .folder-foot {
+      padding-top: 7px;
+      border-top: 1px solid var(--card-border);
+      font-size: 0.66rem;
+      line-height: 1.45;
+      color: var(--muted);
+      word-break: break-all;
     }
 
     .brand {
@@ -796,6 +911,24 @@
       word-break: break-all;
     }
 
+    @media (max-width: 900px) {
+      .layout {
+        display: block;
+        padding: 20px 16px 48px;
+      }
+
+      .folders {
+        position: static;
+        width: auto;
+        max-height: 240px;
+        margin-bottom: 16px;
+      }
+
+      .page {
+        max-width: none;
+      }
+    }
+
     @media (max-width: 500px) {
       .brand h1 {
         font-size: 3rem;
@@ -828,7 +961,17 @@
 </head>
 
 <body>
-  <div class="page">
+  <div class="layout">
+    <aside class="folders">
+      <div class="folders-head">
+        <span>Save to</span>
+        <button class="link-btn" id="treeRefresh" title="Refresh folder list">refresh</button>
+      </div>
+      <nav class="folder-tree" id="folderTree" aria-label="Folder navigation"></nav>
+      <div class="folder-foot" id="folderPath">Loading folders…</div>
+    </aside>
+
+    <div class="page">
     <div class="brand">
       <h1>Clip<em>Nip</em></h1>
       <p>Free Youtube Downloader</p>
@@ -836,13 +979,6 @@
 
     <textarea id="urls" placeholder="Paste one or more URLs..." rows="8"></textarea>
     <p class="hint">Multiple links? Separate with spaces, commas, or newlines.</p>
-
-    <div class="settings">
-      <span class="settings-label">Save to</span>
-      <input id="dirInput" type="text" spellcheck="false" placeholder="%USERPROFILE%\Downloads\ClipNip">
-      <button class="settings-btn" onclick="browseDir()">Browse</button>
-      <div class="settings-note" id="dirNote"></div>
-    </div>
 
     <div class="auth">
       <label class="auth-toggle">
@@ -879,7 +1015,7 @@
         <span class="auth-note" id="compStatus"></span>
       </div>
       <div class="auth-body" id="compBody" style="display:none">
-        <div class="auth-row">
+        <div class="auth-row" id="compUrlRow">
           <input id="compUrl" type="text" spellcheck="false" placeholder="https://example.com/clipnip">
           <button class="settings-btn" onclick="saveComponents()">Apply</button>
         </div>
@@ -892,6 +1028,10 @@
       <button class="mode-btn active" data-mode="video" onclick="setMode(this)">
         <span class="mode-label">Video MP4</span>
         <span class="mode-note">Best compatible video + audio, merged to MP4.</span>
+      </button>
+      <button class="mode-btn" data-mode="video_noaudio" onclick="setMode(this)">
+        <span class="mode-label">Video MP4, no audio</span>
+        <span class="mode-note">Video stream only — no audio track, smaller file.</span>
       </button>
       <button class="mode-btn" data-mode="m4a" onclick="setMode(this)">
         <span class="mode-label">Audio M4A</span>
@@ -920,12 +1060,14 @@
         <button class="link-btn" onclick="openLogFolder()">Open log file</button>
       </div>
     </div>
+    </div>
   </div>
 
   <script>
     let currentMode = 'video';
     let cardData = [];
     let totalCount = 0;
+    let fetchGen = 0;
 
     function updateSummary() {
       let el = document.getElementById('dl-summary');
@@ -956,56 +1098,193 @@
       `;
     }
 
-    async function loadDir() {
+    let downloadDir = '';
+    let drives = [];
+    let fsLoaded = false;
+
+    function normPath(p) {
+      return (p || '').replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase();
+    }
+
+    function samePath(a, b) {
+      return normPath(a) === normPath(b);
+    }
+
+    function makeNode(name, path, depth, isDrive) {
+      return { name, path, depth, isDrive: !!isDrive, expanded: false, loaded: false, loading: false, children: [], error: '' };
+    }
+
+    async function loadSettings() {
       try {
         const res = await fetch('/api/settings', { cache: 'no-store' });
         const data = await res.json();
-        if (data.download_dir) document.getElementById('dirInput').value = data.download_dir;
-      } catch { /* keep default placeholder */ }
+        if (data.download_dir) downloadDir = data.download_dir;
+      } catch { /* останется значение по умолчанию */ }
+      document.getElementById('folderPath').textContent = downloadDir || 'Choose a folder';
+      await loadDrives();
+      if (downloadDir) await revealPath(downloadDir);
     }
 
-    async function browseDir() {
-      const note = document.getElementById('dirNote');
-      note.textContent = '';
+    async function loadDrives() {
       try {
-        const res = await fetch('/api/settings', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ browse: true }),
-        });
+        const res = await fetch('/api/fs/drives', { cache: 'no-store' });
         const data = await res.json();
-        if (data.download_dir) {
-          document.getElementById('dirInput').value = data.download_dir;
-          note.textContent = 'Folder applied';
-        }
+        drives = (data.drives || []).map(d => makeNode(d.name, d.path, 0, true));
       } catch (err) {
-        note.textContent = err.message || 'Failed';
+        document.getElementById('folderPath').textContent = 'Could not list drives: ' + err.message;
       }
+      fsLoaded = true;
+      renderTree();
     }
 
-    async function applyDir() {
-      const note = document.getElementById('dirNote');
-      const dir = document.getElementById('dirInput').value.trim();
-      if (!dir) { note.textContent = 'Enter a folder path'; return; }
+    async function loadChildren(node) {
+      if (node.loaded || node.loading) return;
+      node.loading = true;
+      renderTree();
+      try {
+        const res = await fetch('/api/fs/list?path=' + encodeURIComponent(node.path), { cache: 'no-store' });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'No access');
+        node.children = (data.dirs || []).map(d => makeNode(d.name, d.path, node.depth + 1, false));
+        node.error = '';
+      } catch (err) {
+        node.error = err.message || 'No access';
+      }
+      node.loaded = true;
+      node.loading = false;
+      renderTree();
+    }
+
+    async function toggleExpand(node) {
+      node.expanded = !node.expanded;
+      renderTree();
+      if (node.expanded && !node.loaded) await loadChildren(node);
+    }
+
+    async function selectDir(node) {
+      if (node.isDrive) {
+        await toggleExpand(node);
+        return;
+      }
       try {
         const res = await fetch('/api/settings', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ download_dir: dir }),
+          body: JSON.stringify({ download_dir: node.path }),
         });
         const data = await res.json();
         if (!res.ok || data.error) {
-          note.textContent = data.error || 'Failed';
+          document.getElementById('folderPath').textContent = 'Could not use this folder: ' + (data.error || 'failed');
           return;
         }
-        document.getElementById('dirInput').value = data.download_dir;
-        note.textContent = 'Folder applied';
+        downloadDir = data.download_dir || node.path;
+        document.getElementById('folderPath').textContent = downloadDir;
+        if (!node.expanded) {
+          node.expanded = true;
+          if (!node.loaded) await loadChildren(node);
+        }
+        renderTree();
       } catch (err) {
-        note.textContent = err.message || 'Failed';
+        document.getElementById('folderPath').textContent = 'Could not use this folder: ' + err.message;
       }
     }
 
-    loadDir();
+    function appendFolderNode(container, node) {
+      const item = document.createElement('div');
+      item.className = 'folder-item';
+      item.style.setProperty('--depth', String(node.depth));
+      if (samePath(node.path, downloadDir)) item.classList.add('active');
+
+      const arrow = document.createElement('button');
+      arrow.type = 'button';
+      arrow.className = 'folder-arrow';
+      arrow.textContent = node.loading ? '…' : (node.expanded ? '▾' : '▸');
+      arrow.title = node.expanded ? 'Collapse' : 'Expand';
+      arrow.addEventListener('click', e => {
+        e.stopPropagation();
+        toggleExpand(node);
+      });
+
+      const label = document.createElement('button');
+      label.type = 'button';
+      label.className = 'folder-label';
+      label.textContent = node.name;
+      label.title = node.path;
+      label.addEventListener('click', () => selectDir(node));
+
+      item.append(arrow, label);
+      container.appendChild(item);
+
+      if (!node.expanded) return;
+      if (node.loading) {
+        container.appendChild(folderMessage('Loading…', node.depth + 1));
+        return;
+      }
+      if (node.error) {
+        container.appendChild(folderMessage(node.error, node.depth + 1));
+        return;
+      }
+      if (!node.children.length) {
+        container.appendChild(folderMessage('No subfolders', node.depth + 1));
+        return;
+      }
+      for (const child of node.children) appendFolderNode(container, child);
+    }
+
+    function folderMessage(text, depth) {
+      const msg = document.createElement('div');
+      msg.className = 'folder-msg';
+      msg.style.setProperty('--depth', String(depth));
+      msg.textContent = text;
+      return msg;
+    }
+
+    function renderTree() {
+      const tree = document.getElementById('folderTree');
+      const scroll = tree.scrollTop;
+      tree.textContent = '';
+      if (!fsLoaded) {
+        tree.appendChild(folderMessage('Loading drives…', 0));
+        return;
+      }
+      if (!drives.length) {
+        tree.appendChild(folderMessage('No local drives found', 0));
+        return;
+      }
+      for (const drive of drives) appendFolderNode(tree, drive);
+      tree.scrollTop = scroll;
+    }
+
+    async function revealPath(path) {
+      const letter = path.slice(0, 2).toUpperCase();
+      const drive = drives.find(d => d.isDrive && normPath(d.path).startsWith(normPath(letter)));
+      if (!drive) return;
+      drive.expanded = true;
+      await loadChildren(drive);
+      let node = drive;
+      let prefix = drive.path.replace(/[\\/]+$/, '');
+      const rest = path.slice(2).split(/[\\/]/).filter(Boolean);
+      for (const part of rest) {
+        const wanted = normPath(prefix + '\\' + part);
+        const child = node.children.find(c => normPath(c.path) === wanted);
+        if (!child) break;
+        child.expanded = true;
+        node = child;
+        prefix = child.path.replace(/[\\/]+$/, '');
+        await loadChildren(child);
+      }
+      renderTree();
+    }
+
+    document.getElementById('treeRefresh').addEventListener('click', async () => {
+      drives = [];
+      fsLoaded = false;
+      renderTree();
+      await loadDrives();
+      if (downloadDir) await revealPath(downloadDir);
+    });
+
+    loadSettings();
 
     async function loadEngine() {
       const line = document.getElementById('engineLine');
@@ -1015,7 +1294,8 @@
         const d = await res.json();
         const parts = [`yt-dlp ${d.version || 'unknown'}`];
         if (!d.ffmpeg) parts.push('ffmpeg missing');
-        if (d.stale) parts.push(`on-disk differs from embedded ${d.embedded}`);
+        if (d.stale) parts.push(`older than embedded ${d.embedded}`);
+        else if (d.differs) parts.push(`embedded ${d.embedded}`);
         line.textContent = parts.join(' · ');
         foot.classList.toggle('stale', !!d.stale || !d.ffmpeg);
       } catch {
@@ -1202,6 +1482,8 @@
     function renderComponents(d) {
       const note = document.getElementById('compNote');
       document.getElementById('compUrl').value = d.url || '';
+      const row = document.getElementById('compUrlRow');
+      if (row) row.style.display = d.can_fetch ? '' : 'none';
       document.getElementById('compBody').style.display = d.ready ? 'none' : 'flex';
 
       const status = document.getElementById('compStatus');
@@ -1278,15 +1560,6 @@
       try { await fetch('/api/log', { method: 'POST', cache: 'no-store' }); } catch (e) { /* ignore */ }
     }
 
-    const dirInput = document.getElementById('dirInput');
-    dirInput.addEventListener('change', applyDir);
-    dirInput.addEventListener('keydown', e => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        applyDir();
-      }
-    });
-
     function setMode(btn) {
       document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
@@ -1319,9 +1592,9 @@
     }
 
     function esc(s) {
-      const d = document.createElement('div');
-      d.textContent = s ?? '';
-      return d.innerHTML;
+      return String(s ?? '').replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      })[c]);
     }
 
     function safeUrl(u) {
@@ -1329,9 +1602,11 @@
     }
 
     function friendlyError(err = '') {
-      // extractor отработал, но видеопоток не отдали — устаревший движок
-      if (err.includes('unable to download video data')) return 'Engine too old to fetch this stream';
-      if (err.includes('unable to download api page')) return 'Engine too old to fetch this stream';
+      // Метаданные получены, но поток не отдали. Утверждать «движок устарел»
+      // нельзя: на свежем движке это адрес/VPN/истёкшая подпись. Точнее
+      // скажет error_hint с бэкенда.
+      if (err.includes('unable to download video data')) return 'The site refused to send the stream — see the hint below';
+      if (err.includes('unable to download api page')) return 'The site refused to send the stream — see the hint below';
       // отказ сайта: нужна сессия
       if (err.includes('Sign in to confirm')) return 'Site requires a logged-in session';
       if (err.includes('age-restricted')) return 'This video is age-restricted';
@@ -1351,6 +1626,7 @@
     function modeLabel(mode) {
       const labels = {
         video: 'Video MP4',
+        video_noaudio: 'Video MP4, no audio',
         m4a: 'Audio M4A',
         mp3_128: 'Audio MP3 128',
         mp3_192: 'Audio MP3 192'
@@ -1359,7 +1635,7 @@
     }
 
     function isVideoMode(mode) {
-      return mode === 'video';
+      return mode === 'video' || mode === 'video_noaudio';
     }
 
     function activeModeForCard(c) {
@@ -1417,6 +1693,11 @@
       const container = document.getElementById('cards');
       btn.disabled = true;
       btn.textContent = 'Loading...';
+
+      // Старые поллеры не должны переписывать карточки нового поиска:
+      // они работали с индексом и после очистки попадали в чужие карточки.
+      fetchGen++;
+      for (const c of cardData) clearTimeout(c.pollTimer);
       container.innerHTML = '';
       cardData = [];
 
@@ -1548,7 +1829,7 @@
       if (!isVideo) {
         thumbHtml = `<div class="no-thumb" style="color:var(--accent)"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="5 3 19 12 5 21 5 3"/></svg></div>`;
       } else if (c.thumbnail) {
-        thumbHtml = `<img src="${safeUrl(c.thumbnail)}" alt="">`;
+        thumbHtml = `<img src="${esc(safeUrl(c.thumbnail))}" alt="">`;
       } else {
         thumbHtml = `<div class="no-thumb"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="2"/><circle cx="8" cy="8" r="1.5"/><path d="m21 15-5-5L5 21"/></svg></div>`;
       }
@@ -1587,6 +1868,11 @@
           <button class="card-dl-btn" onclick="dlCard(${idx}, true)">Download anyway</button>
           <button class="card-dl-btn done" onclick="openFolder(${idx})">Open folder</button>
           <span class="card-status done">Already downloaded · ${esc(c.filename || '')}</span>
+        `;
+      } else if (c.status === 'cancelled') {
+        actionHtml = `
+          <button class="card-dl-btn" onclick="dlCard(${idx})">Retry</button>
+          <span class="card-status">Cancelled</span>
         `;
       } else if (c.status === 'error') {
         actionHtml = `
@@ -1661,6 +1947,7 @@
 
     async function dlCard(idx, force) {
       const c = cardData[idx];
+      const gen = fetchGen;
       c.requestMode = currentMode;
       c.status = 'queued';
       c.error = null;
@@ -1679,13 +1966,14 @@
           body: JSON.stringify({
             url: c.url,
             mode: c.requestMode,
-            format_id: c.requestMode === 'video' ? c.selectedFormatId : null,
+            format_id: isVideoMode(c.requestMode) ? c.selectedFormatId : null,
             title: c.title || '',
             force: !!force,
           }),
         });
 
         const data = await res.json();
+        if (gen !== fetchGen || cardData[idx] !== c) return;
 
         if (!res.ok || data.error) {
           c.status = 'error';
@@ -1694,11 +1982,11 @@
           return;
         }
 
-      c.jobId = data.job_id;
-      c.resumed = !!data.resumed;
-      c.startedAt = Date.now();
-      c.elapsed = null;
-      c.retries = 0;
+        c.jobId = data.job_id;
+        c.resumed = !!data.resumed;
+        c.startedAt = Date.now();
+        c.elapsed = null;
+        c.retries = 0;
 
         if (data.status === 'done') {
           c.status = 'done';
@@ -1707,7 +1995,7 @@
           return;
         }
 
-        pollCard(idx);
+        pollCard(idx, fetchGen);
       } catch (err) {
         c.status = 'error';
         c.error = err.message || 'Request failed';
@@ -1715,13 +2003,16 @@
       }
     }
 
-    async function pollCard(idx) {
+    async function pollCard(idx, gen) {
+      if (gen !== fetchGen) return;
       const c = cardData[idx];
+      if (!c) return;
       clearTimeout(c.pollTimer);
 
       try {
         const res = await fetch(`/api/status/${c.jobId}`, { cache: 'no-store' });
         const data = await res.json();
+        if (gen !== fetchGen || cardData[idx] !== c) return;
 
         if (!res.ok || data.error) {
           c.status = 'error';
@@ -1759,7 +2050,7 @@
           return;
         }
 
-        c.pollTimer = setTimeout(() => pollCard(idx), 1500);
+        c.pollTimer = setTimeout(() => pollCard(idx, gen), 1500);
       } catch {
         c.status = 'error';
         c.error = 'Lost connection to server';

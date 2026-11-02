@@ -372,7 +372,9 @@ func cleanupStaleParts() {
 	cutoff := time.Now().Add(-partTTL)
 	matches, _ := filepath.Glob(filepath.Join(dir, "*.part"))
 	ytdlMatches, _ := filepath.Glob(filepath.Join(dir, "*.ytdl"))
+	naMatches, _ := filepath.Glob(filepath.Join(dir, "*.na.tmp.*"))
 	matches = append(matches, ytdlMatches...)
+	matches = append(matches, naMatches...)
 	for _, p := range matches {
 		if fi, err := os.Stat(p); err == nil && fi.ModTime().Before(cutoff) {
 			os.Remove(p)
@@ -391,7 +393,7 @@ func hasPartial(dir, id string) bool {
 }
 
 func cleanupTempFiles(dir, id string) {
-	for _, pattern := range []string{id + ".*.part", id + ".part", id + ".*.ytdl", id + ".ytdl"} {
+	for _, pattern := range []string{id + ".*.part", id + ".part", id + ".*.ytdl", id + ".ytdl", id + ".na.tmp.*"} {
 		matches, _ := filepath.Glob(filepath.Join(dir, pattern))
 		for _, p := range matches {
 			os.Remove(p)
@@ -404,7 +406,8 @@ func findFinalFile(dir, id, mode string) string {
 	matches, _ := filepath.Glob(filepath.Join(dir, id+".*"))
 	for _, f := range matches {
 		low := strings.ToLower(f)
-		if strings.HasSuffix(low, ".part") || strings.HasSuffix(low, ".ytdl") {
+		if strings.HasSuffix(low, ".part") || strings.HasSuffix(low, ".ytdl") ||
+			strings.Contains(low, ".na.tmp.") {
 			continue
 		}
 		files = append(files, f)
@@ -427,21 +430,35 @@ func findFinalFile(dir, id, mode string) string {
 
 func sortByModTimeDesc(paths []string) {
 	sort.Slice(paths, func(i, j int) bool {
-		fi, _ := os.Stat(paths[i])
-		fj, _ := os.Stat(paths[j])
+		fi, errI := os.Stat(paths[i])
+		fj, errJ := os.Stat(paths[j])
+		if errI != nil || errJ != nil {
+			return errI == nil && errJ != nil
+		}
 		return fi.ModTime().After(fj.ModTime())
 	})
 }
 
 func preferredExts(mode string) []string {
-	switch mode {
-	case "video":
+	switch {
+	case isVideoMode(mode):
 		return []string{".mp4", ".mkv", ".webm"}
-	case "m4a":
+	case mode == modeM4A:
 		return []string{".m4a", ".webm", ".opus"}
 	default:
 		return []string{".mp3", ".m4a", ".webm", ".opus"}
 	}
+}
+
+// outputName — имя файла, которое получится после renameTo. У режима без
+// звука отдельный суффикс: иначе обычное видео с тем же названием считалось
+// бы уже скачанным и no-audio задача молча пропускалась.
+func outputName(title, fallback, mode, ext string) string {
+	base := sanitizeFilename(title, fallback)
+	if mode == modeVideoNoAudio {
+		base += noAudioSuffix
+	}
+	return base + ext
 }
 
 // findExistingFile ищет уже скачанный файл в папке загрузки: то же имя, что
@@ -450,9 +467,8 @@ func findExistingFile(dir, title, fallback, mode string) string {
 	if strings.TrimSpace(title) == "" {
 		return ""
 	}
-	base := sanitizeFilename(title, fallback)
 	for _, ext := range preferredExts(mode) {
-		p := filepath.Join(dir, base+ext)
+		p := filepath.Join(dir, outputName(title, fallback, mode, ext))
 		if fileExists(p) {
 			return p
 		}
@@ -460,11 +476,28 @@ func findExistingFile(dir, title, fallback, mode string) string {
 	return ""
 }
 
+const (
+	modeVideo        = "video"
+	modeVideoNoAudio = "video_noaudio"
+	modeM4A          = "m4a"
+	modeMP3128       = "mp3_128"
+	modeMP3192       = "mp3_192"
+	noAudioSuffix    = " (no audio)"
+)
+
 var (
 	formatIDRe   = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 	audioModeRe  = regexp.MustCompile(`^(m4a|mp3_128|mp3_192)$`)
 	unsafeNameRe = regexp.MustCompile(`[\\/:*?"<>|\x00-\x1F]`)
 )
+
+func isVideoMode(mode string) bool {
+	return mode == modeVideo || mode == modeVideoNoAudio
+}
+
+func validMode(mode string) bool {
+	return isVideoMode(mode) || audioModeRe.MatchString(mode)
+}
 
 func buildDownloadArgs(job *Job) []string {
 	outtmpl := filepath.Join(job.DownloadDir, job.JobID+".%(ext)s")
@@ -479,19 +512,30 @@ func buildDownloadArgs(job *Job) []string {
 	}
 
 	switch job.Mode {
-	case "video":
+	case modeVideo:
 		if job.FormatID != "" {
-			base = append(base, "--format", job.FormatID+"+bestaudio[ext=m4a]/bestaudio")
+			// Fallback обязан сохранять видео: `.../bestaudio` на сайте без
+			// m4a-аудио (X отдаёт mp4/HLS) выбирал только звук. Именно это
+			// выглядело как «не тянет видео с X».
+			base = append(base, "--format",
+				job.FormatID+"+bestaudio[ext=m4a]/"+job.FormatID+"+bestaudio/"+job.FormatID)
 		} else {
 			base = append(base, "--format",
 				"bestvideo[vcodec*=avc1][ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best")
 		}
 		base = append(base, "--merge-output-format", "mp4")
-	case "m4a":
+	case modeVideoNoAudio:
+		if job.FormatID != "" {
+			base = append(base, "--format", job.FormatID)
+		} else {
+			base = append(base, "--format",
+				"bestvideo[vcodec*=avc1][ext=mp4]/bestvideo[ext=mp4]/bestvideo/best")
+		}
+	case modeM4A:
 		base = append(base, "--format", "bestaudio[ext=m4a]/bestaudio")
 	default:
 		quality := "128"
-		if job.Mode == "mp3_192" {
+		if job.Mode == modeMP3192 {
 			quality = "192"
 		}
 		base = append(base, "--format", "bestaudio[ext=m4a]/bestaudio",
@@ -529,7 +573,9 @@ func classifyError(msg string) string {
 	case strings.Contains(lower, "unable to download video data"),
 		strings.Contains(lower, "unable to download api page"):
 		return errStream
-	case strings.Contains(lower, "429"), strings.Contains(lower, "too many requests"):
+	case strings.Contains(lower, "http error 429"), strings.Contains(lower, "too many requests"):
+		// Именно «HTTP Error 429», а не подстрока «429»: номер мог встретиться
+		// в id ролика или URL и превратить фатальную ошибку в троттлинг.
 		return errThrottle
 	case strings.Contains(lower, "sign in to confirm"),
 		strings.Contains(lower, "confirm you're not a bot"),
@@ -540,7 +586,7 @@ func classifyError(msg string) string {
 		strings.Contains(lower, "http error 403"),
 		strings.Contains(lower, "age-restricted"):
 		return errSite
-	case fatalErrRe.MatchString(lower):
+	case fatalErrRe.MatchString(lower), strings.Contains(lower, "engine components are missing"):
 		return errFatal
 	default:
 		return errNetwork
@@ -572,7 +618,7 @@ func errorHint(kind, msg string, resumed int64) string {
 		if enginePossiblyStale() {
 			return "The embedded yt-dlp is older than the last build known to work with YouTube's current player clients. Rebuild ClipNip to update the engine."
 		}
-		hint := "YouTube found the video but refused to send the stream. On an up-to-date engine this is the address: switching VPN mid-download, a shared or already-exhausted VPN exit, or a link that expired on a very large file. Pick a stable connection and press Retry"
+		hint := "The site found the video but refused to send the stream. On an up-to-date engine the usual causes are the address: switching VPN mid-download, a shared or already-exhausted VPN exit, or a signed link that expired on a very large file. Pick a stable connection and press Retry"
 		if resumed > 0 {
 			hint += " — it continues from " + humanBytes(resumed) + ", nothing is lost."
 		} else {
@@ -593,6 +639,14 @@ func errorHint(kind, msg string, resumed int64) string {
 				hint += " Retry continues from " + humanBytes(resumed) + "."
 			}
 			return hint
+		}
+
+	case errFatal:
+		if strings.Contains(strings.ToLower(msg), "engine components are missing") {
+			if allowRemoteFetch {
+				return "The engine components are not installed. Set the component server address in settings, or put yt-dlp/ffmpeg into the clipnip-bin folder next to the exe."
+			}
+			return "The engine components are not installed. Put yt-dlp/ffmpeg into the clipnip-bin folder next to the exe."
 		}
 	}
 	return ""
@@ -664,7 +718,13 @@ func runDownload(job *Job) {
 	// skipped, cancel, panic — все терминальные состояния одним хуком
 	defer persistQueue()
 
+	started := false
 	job.set(func() {
+		// Между claim() и этим локом пользователь мог отменить или поставить
+		// на паузу. Раньше безусловная запись downloading воскрешала задачу.
+		if job.Status != "queued" {
+			return
+		}
 		job.Status = "downloading"
 		job.Stage = "downloading"
 		job.Error = ""
@@ -680,7 +740,11 @@ func runDownload(job *Job) {
 		job.LastTickAt = time.Time{}
 		job.LastTickBytes = 0
 		job.LastDataAt = time.Time{}
+		started = true
 	})
+	if !started {
+		return
+	}
 
 	if job.Title == "" {
 		if title, err := fetchTitle(job.URL); err == nil {
@@ -769,6 +833,16 @@ func runDownload(job *Job) {
 			markCancelled(job)
 			return
 		}
+		// Новая попытка (в т.ч. format fallback) начинает счётчики склейки
+		// заново: иначе откат байтов после смены формата прибавлял полный
+		// размер прошлого компонента к DoneTotal и раздувал итог.
+		job.set(func() {
+			job.CurTotal = 0
+			job.CurDownloaded = 0
+			job.DoneTotal = 0
+			job.LastTickAt = time.Time{}
+			job.LastTickBytes = 0
+		})
 		args := append(buildDownloadArgs(job), job.URL)
 		err := runYtDlp(job, args, onProgress)
 		if err == nil {
@@ -841,7 +915,7 @@ func runDownload(job *Job) {
 			}
 			job.RetryWait += delay
 		})
-		if job.Status == "paused" {
+		if job.isPaused() {
 			return
 		}
 		// суммарное время именно в ожидании между попытками, а не «сколько
@@ -895,11 +969,29 @@ func runDownload(job *Job) {
 		return
 	}
 
+	// Процесс мог закончиться успешно уже после отмены/паузы. Не начинаем
+	// постобработку поверх терминального состояния.
+	if job.isCancelled() {
+		markCancelled(job)
+		return
+	}
+	if job.isPaused() {
+		return
+	}
+
+	processing := false
 	job.set(func() {
+		if job.Status == "cancelled" || job.Status == "paused" {
+			return
+		}
 		job.Status = "processing"
 		job.Stage = "processing"
 		job.Progress = 100
+		processing = true
 	})
+	if !processing {
+		return
+	}
 
 	final := findFinalFile(dir, job.JobID, job.Mode)
 	if final == "" || !fileExists(final) {
@@ -912,16 +1004,48 @@ func runDownload(job *Job) {
 		return
 	}
 
+	// Режим без звука: выбранный формат может оказаться мультиплексным
+	// (видео+аудио), поэтому результат проверяется и при необходимости
+	// пересобирается без аудиодорожки. Для video-only потока это no-op.
+	if job.Mode == modeVideoNoAudio {
+		if job.isCancelled() {
+			markCancelled(job)
+			return
+		}
+		if job.isPaused() {
+			return
+		}
+		if err := ensureNoAudio(job, final); err != nil {
+			job.set(func() {
+				if job.Status == "cancelled" || job.Status == "paused" {
+					return
+				}
+				job.Status = "error"
+				job.Stage = "error"
+				job.Error = "Could not remove the audio track: " + err.Error()
+			})
+			log.Printf("no-audio strip failed job=%s: %v", job.JobID, err)
+			return
+		}
+	}
+
 	ext := filepath.Ext(final)
-	title := sanitizeFilename(job.Title, job.JobID)
-	filename := title + ext
+	job.mu.RLock()
+	title := job.Title
+	job.mu.RUnlock()
+	filename := outputName(title, job.JobID, job.Mode, ext)
 	cleanupTempFiles(dir, job.JobID)
 
 	if renamed, err := renameTo(final, filename); err == nil {
 		final = renamed
+		filename = filepath.Base(final)
 	}
 
+	done := false
 	job.set(func() {
+		if job.Status == "cancelled" || job.Status == "paused" {
+			return
+		}
 		job.Status = "done"
 		job.Stage = "done"
 		job.Progress = 100
@@ -929,8 +1053,11 @@ func runDownload(job *Job) {
 		job.Filename = filename
 		job.Speed = 0
 		job.ETA = 0
+		done = true
 	})
-	adaptSuccess()
+	if done {
+		adaptSuccess()
+	}
 }
 
 func markCancelled(job *Job) {
@@ -949,11 +1076,21 @@ func renameTo(path, filename string) (string, error) {
 	if _, err := os.Stat(dest); err == nil {
 		ext := filepath.Ext(filename)
 		base := strings.TrimSuffix(filename, ext)
-		for i := 1; ; i++ {
+		free := false
+		for i := 1; i < 10000; i++ {
 			dest = filepath.Join(filepath.Dir(path), fmt.Sprintf("%s (%d)%s", base, i, ext))
-			if _, err := os.Stat(dest); os.IsNotExist(err) {
+			_, statErr := os.Stat(dest)
+			if os.IsNotExist(statErr) {
+				free = true
 				break
 			}
+			if statErr != nil {
+				// Ошибка доступа — не повод крутить вечный цикл.
+				return path, statErr
+			}
+		}
+		if !free {
+			return path, fmt.Errorf("no free filename for %q", filename)
 		}
 	}
 	if err := os.Rename(path, dest); err != nil {
@@ -1068,7 +1205,16 @@ func sanitizeFilename(name, fallback string) string {
 		return fallback
 	}
 	if len(name) > 180 {
-		name = name[:180]
+		// Режем по границе руны: name[:180] рвал многобайтовый символ
+		// (кириллица) и давал невалидное UTF-8 имя файла.
+		cut := 0
+		for i := range name {
+			if i > 180 {
+				break
+			}
+			cut = i
+		}
+		name = name[:cut]
 	}
 	return strings.TrimRight(name, ". ")
 }
@@ -1135,6 +1281,7 @@ func resumeJob(id string) bool {
 	job.Stage = "queued"
 	job.Error = ""
 	job.Stuck = false
+	job.Retries = 0
 	job.FirstRetryAt = time.Time{}
 	job.RetryWait = 0
 	job.mu.Unlock()

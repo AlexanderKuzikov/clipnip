@@ -73,8 +73,18 @@ func probeReach(rawURL string) reachResult {
 		return reachResult{reachDNS, reachDetail(reachDNS)}
 	}
 
+	// Порт из URL, а не всегда 443: для http:// и нестандартных портов
+	// вердикт tcp был ложным.
+	port := u.Port()
+	if port == "" {
+		if strings.EqualFold(u.Scheme, "http") {
+			port = "80"
+		} else {
+			port = "443"
+		}
+	}
 	d := net.Dialer{Timeout: 5 * time.Second}
-	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, "443"))
+	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
 	if err != nil {
 		return reachResult{reachTCP, reachDetail(reachTCP)}
 	}

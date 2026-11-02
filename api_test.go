@@ -1,18 +1,22 @@
 package main
 
 import (
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // Конфиг уводим во временный каталог: тесты не должны писать в реальный
@@ -542,7 +546,10 @@ func TestRestoreQueueSkipsGarbage(t *testing.T) {
 	localDir := t.TempDir()
 	oldOverride := configDirOverride
 	configDirOverride = localDir
-	t.Cleanup(func() { configDirOverride = oldOverride })
+	t.Cleanup(func() {
+		os.Remove(queueFilePath())
+		configDirOverride = oldOverride
+	})
 
 	junk := `[{"url":"ftp://evil/x","mode":"video"},{"url":"https://ok.test/v","mode":"nonsense"}]`
 	if err := os.WriteFile(queueFilePath(), []byte(junk), 0o600); err != nil {
@@ -796,9 +803,16 @@ func TestEmbeddedHashesWellFormed(t *testing.T) {
 		t.Fatalf("want at least yt-dlp, deno, ffmpeg, got %d", len(embeddedBins))
 	}
 	seen := map[string]string{}
+	// В тонких сборках (clipnipremote, clipnipportable) архивы не вшиты, и
+	// сверять нечего — но список компонентов и их хеши как константы всё
+	// равно обязаны быть в порядке.
+	wantGz := ytdlpGz != ""
 	for _, b := range embeddedBins {
-		if b.name == "" || b.gz == "" {
-			t.Errorf("bin without name/source: %+v", b)
+		if b.name == "" {
+			t.Errorf("bin without name: %+v", b)
+		}
+		if wantGz && b.gz == "" {
+			t.Errorf("bin without source: %+v", b)
 		}
 		if b.sha256 == "" {
 			t.Logf("%s: без проверки целостности (ручное обновление)", b.name)
@@ -844,37 +858,34 @@ func TestFileSHA256DetectsChange(t *testing.T) {
 }
 
 func TestManifestParsing(t *testing.T) {
-	// Структуру манифеста проверяем без сети: неверный формат обязан быть
-	// отвергнут, а не приводить к установке непроверяемого файла.
+	// Проверяем ту же функцию, что вызывает loadManifest, а не её копию:
+	// иначе тест перестаёт ловить расхождение между ними.
 	good := `{"version":1,"components":[
 		{"name":"yt-dlp.exe","version":"2026.09.27","file":"yt-dlp.exe","sha256":"` +
 		strings.Repeat("a", 64) + `"}]}`
-	if !strings.Contains(good, `"version":1`) {
-		t.Fatal("bad fixture")
+	var mf manifest
+	if err := json.Unmarshal([]byte(good), &mf); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateManifest(&mf); err != nil {
+		t.Fatalf("valid manifest rejected: %v", err)
 	}
 
 	bad := []string{
-		`{"version":2,"components":[]}`,                                                            // неизвестная версия формата
-		`{"version":1,"components":[{"name":"x.exe","file":"x"}]}`,                                 // нет хеша
-		`{"version":1,"components":[{"name":"x.exe","file":"x","sha256":"abc"}]}`,                  // короткий хеш
-		`{"version":1,"components":[{"file":"x","sha256":"` + strings.Repeat("a", 64) + `"}]}`,     // нет имени
-		`{"version":1,"components":[{"name":"x.exe","sha256":"` + strings.Repeat("a", 64) + `"}]}`, // нет файла
+		`{"version":2,"components":[]}`,                                                                       // неизвестная версия формата
+		`{"version":1,"components":[{"name":"x.exe","file":"x"}]}`,                                            // нет хеша
+		`{"version":1,"components":[{"name":"x.exe","file":"x","sha256":"abc"}]}`,                             // короткий хеш
+		`{"version":1,"components":[{"name":"x.exe","file":"x","sha256":"` + strings.Repeat("z", 64) + `"}]}`, // не hex
+		`{"version":1,"components":[{"file":"x","sha256":"` + strings.Repeat("a", 64) + `"}]}`,                // нет имени
+		`{"version":1,"components":[{"name":"x.exe","sha256":"` + strings.Repeat("a", 64) + `"}]}`,            // нет файла
 	}
 	for _, body := range bad {
-		var mf manifest
-		if err := json.Unmarshal([]byte(body), &mf); err == nil {
-			// разбираем так же, как loadManifest
-			if mf.Version == manifestVersion {
-				rejected := false
-				for _, c := range mf.Components {
-					if c.Name == "" || c.File == "" || len(c.SHA256) != 64 {
-						rejected = true
-					}
-				}
-				if !rejected {
-					t.Errorf("manifest must be rejected: %s", body)
-				}
-			}
+		var m manifest
+		if err := json.Unmarshal([]byte(body), &m); err != nil {
+			continue
+		}
+		if err := validateManifest(&m); err == nil {
+			t.Errorf("manifest must be rejected: %s", body)
 		}
 	}
 }
@@ -937,7 +948,7 @@ func TestDownloadRequiresHTTPS(t *testing.T) {
 	if err := downloadComponent("http://example.com/bin", mc, filepath.Join(t.TempDir(), "x.exe")); err == nil {
 		t.Error("plain http must be refused for executable components")
 	}
-	if err := downloadComponent("https://example.com/bin", mc, filepath.Join(t.TempDir(), "x.exe")); err == nil {
+	if err := downloadComponent("https://127.0.0.1:1/bin", mc, filepath.Join(t.TempDir(), "x.exe")); err == nil {
 		t.Error("unreachable host must return an error")
 	}
 }
@@ -957,8 +968,9 @@ func TestPortableDirDetection(t *testing.T) {
 }
 
 func TestComponentsConfigRoundTrip(t *testing.T) {
+	oldOverride := configDirOverride
 	configDirOverride = t.TempDir()
-	t.Cleanup(func() { configDirOverride = "" })
+	t.Cleanup(func() { configDirOverride = oldOverride })
 
 	config.Lock()
 	config.ComponentsURL = ""
@@ -994,18 +1006,24 @@ func TestEnsureBinsNotFatalWhenComponentsMissing(t *testing.T) {
 		configDirOverride, binDirOverride = oldConfig, oldBin
 		embeddedBins = origBins
 		restore()
+		componentsMu.Lock()
 		componentStates = nil
 		componentsProblem = ""
+		componentsResolved = false
+		componentsMu.Unlock()
 		resolvedPaths.Lock()
 		resolvedPaths.m = map[string]string{}
 		resolvedPaths.Unlock()
 	})
 
+	componentsMu.Lock()
 	componentsProblem = ""
+	componentsResolved = false
+	componentsMu.Unlock()
 	if err := ensureBins(); err != nil {
 		t.Fatalf("missing components must not be fatal, got %v", err)
 	}
-	if componentsProblem == "" {
+	if componentsProblemText() == "" {
 		t.Error("problem must be reported even when startup continues")
 	}
 	if componentsReady(requiredComponents()) {
@@ -1166,5 +1184,305 @@ func TestFindExistingFile(t *testing.T) {
 	// небезопасные символы вычищаются так же, как в renameTo
 	if got := findExistingFile(dir, "Bad: Name", "fb", "mp3_192"); filepath.Base(got) != "Bad Name.mp3" {
 		t.Errorf("sanitized title must match, got %q", got)
+	}
+}
+
+// X отдаёт видео как mp4 + аудио как HLS/mp4. Старый fallback
+// `<id>+bestaudio[ext=m4a]/bestaudio` на таком сайте выбирал только звук:
+// это и выглядело как «не тянет видео с X».
+func TestBuildDownloadArgsSelectedFormatKeepsVideo(t *testing.T) {
+	args := buildDownloadArgs(&Job{
+		JobID: "j", DownloadDir: t.TempDir(), Mode: modeVideo, FormatID: "http-2176",
+	})
+	formatArg := ""
+	for i, a := range args {
+		if a == "--format" && i+1 < len(args) {
+			formatArg = args[i+1]
+		}
+	}
+	want := "http-2176+bestaudio[ext=m4a]/http-2176+bestaudio/http-2176"
+	if formatArg != want {
+		t.Fatalf("format selector = %q, want %q", formatArg, want)
+	}
+	if strings.HasSuffix(formatArg, "/bestaudio") {
+		t.Error("fallback must not select audio-only")
+	}
+}
+
+func TestBuildDownloadArgsNoAudio(t *testing.T) {
+	args := buildDownloadArgs(&Job{
+		JobID: "j", DownloadDir: t.TempDir(), Mode: modeVideoNoAudio, FormatID: "137",
+	})
+	formatArg := ""
+	for i, a := range args {
+		if a == "--format" && i+1 < len(args) {
+			formatArg = args[i+1]
+		}
+	}
+	if formatArg != "137" {
+		t.Errorf("no-audio selected format must be the video id alone, got %q", formatArg)
+	}
+
+	args = buildDownloadArgs(&Job{JobID: "j", DownloadDir: t.TempDir(), Mode: modeVideoNoAudio})
+	for i, a := range args {
+		if a == "--format" && i+1 < len(args) {
+			formatArg = args[i+1]
+		}
+	}
+	if strings.Contains(formatArg, "+bestaudio") {
+		t.Errorf("no-audio default format must not merge audio, got %q", formatArg)
+	}
+	if !strings.Contains(formatArg, "bestvideo") {
+		t.Errorf("no-audio default must prefer a video stream, got %q", formatArg)
+	}
+}
+
+func TestNoAudioFilenameSuffix(t *testing.T) {
+	dir := t.TempDir()
+	noAudio := filepath.Join(dir, "Clip"+noAudioSuffix+".mp4")
+	if err := os.WriteFile(noAudio, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := findExistingFile(dir, "Clip", "fb", modeVideoNoAudio); got != noAudio {
+		t.Errorf("no-audio skip must find the suffixed file, got %q", got)
+	}
+	if got := findExistingFile(dir, "Clip", "fb", modeVideo); got != "" {
+		t.Errorf("full-video mode must not treat a no-audio file as downloaded, got %q", got)
+	}
+
+	full := filepath.Join(dir, "Clip.mp4")
+	if err := os.WriteFile(full, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := findExistingFile(dir, "Clip", "fb", modeVideo); got != full {
+		t.Errorf("full video must still be found, got %q", got)
+	}
+	if got := findExistingFile(dir, "Clip", "fb", modeVideoNoAudio); got != noAudio {
+		t.Errorf("no-audio mode must keep its own suffix, got %q", got)
+	}
+}
+
+func TestSanitizeFilenameKeepsUTF8(t *testing.T) {
+	long := strings.Repeat("Ж", 200)
+	got := sanitizeFilename(long, "fb")
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncation split a multibyte rune: %q", got)
+	}
+	if len(got) > 180 {
+		t.Errorf("name too long: %d bytes", len(got))
+	}
+}
+
+func TestRestoreQueueNormalizesMode(t *testing.T) {
+	oldOverride := configDirOverride
+	configDirOverride = t.TempDir()
+	t.Cleanup(func() {
+		os.Remove(queueFilePath())
+		configDirOverride = oldOverride
+		jobs.Lock()
+		for id, j := range jobs.m {
+			if strings.Contains(j.URL, "example.test") {
+				delete(jobs.m, id)
+			}
+		}
+		jobs.Unlock()
+		for len(jobQueue) > 0 {
+			<-jobQueue
+		}
+	})
+
+	entries := `[
+		{"url":"https://example.test/a","mode":"","format_id":"137","title":"A"},
+		{"url":"https://example.test/b","mode":"m4a","format_id":"137","title":"B"}
+	]`
+	if err := os.WriteFile(queueFilePath(), []byte(entries), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restoreQueue()
+
+	videoID := jobID("https://example.test/a", modeVideo, "137")
+	video := getJob(videoID)
+	if video == nil {
+		t.Fatal("empty mode must normalize to video")
+	}
+	if video.Mode != modeVideo || video.FormatID != "137" {
+		t.Errorf("video job normalized wrong: mode=%q format=%q", video.Mode, video.FormatID)
+	}
+
+	audioID := jobID("https://example.test/b", modeM4A, "")
+	audio := getJob(audioID)
+	if audio == nil {
+		t.Fatal("audio job not restored")
+	}
+	if audio.Mode != modeM4A || audio.FormatID != "" {
+		t.Errorf("audio job must drop format id: mode=%q format=%q", audio.Mode, audio.FormatID)
+	}
+}
+
+func TestFSList(t *testing.T) {
+	base := t.TempDir()
+	for _, name := range []string{"alpha", "Beta", ".hidden", "$RECYCLE.BIN"} {
+		if err := os.MkdirAll(filepath.Join(base, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/fs/list?path="+url.QueryEscape(base), nil)
+	rec := httptest.NewRecorder()
+	handleFSList(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		Dirs []fsEntry `json:"dirs"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	names := []string{}
+	for _, d := range got.Dirs {
+		names = append(names, d.Name)
+	}
+	want := []string{"alpha", "Beta"}
+	if strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Errorf("dirs = %v, want %v", names, want)
+	}
+
+	bad := httptest.NewRequest(http.MethodGet, "/api/fs/list?path=relative", nil)
+	badRec := httptest.NewRecorder()
+	handleFSList(badRec, bad)
+	if badRec.Code != http.StatusBadRequest {
+		t.Errorf("relative path must be rejected, got %d", badRec.Code)
+	}
+}
+
+func TestSameOriginRefusesCrossSite(t *testing.T) {
+	ts := httptest.NewServer(sameOrigin(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})))
+	defer ts.Close()
+
+	send := func(method string, headers map[string]string) int {
+		req, _ := http.NewRequest(method, ts.URL+"/api/anything", nil)
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := send(http.MethodGet, nil); got != http.StatusOK {
+		t.Errorf("local request without Origin must pass, got %d", got)
+	}
+	if got := send(http.MethodPost, map[string]string{"Origin": "https://evil.example"}); got != http.StatusForbidden {
+		t.Errorf("cross-origin request must be refused, got %d", got)
+	}
+	if got := send(http.MethodPost, map[string]string{"Sec-Fetch-Site": "cross-site"}); got != http.StatusForbidden {
+		t.Errorf("cross-site fetch must be refused, got %d", got)
+	}
+	if got := send(http.MethodPost, map[string]string{"Origin": ts.URL}); got != http.StatusOK {
+		t.Errorf("same-origin request must pass, got %d", got)
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/anything", nil)
+	req.Host = "evil.example"
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("unexpected Host header must be refused (DNS rebinding), got %d", resp.StatusCode)
+	}
+}
+
+func TestProbeReachUsesURLPort(t *testing.T) {
+	if envProxySet() {
+		t.Skip("proxy env is set")
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer ts.Close()
+	if got := probeReach(ts.URL); got.Verdict != reachOK {
+		t.Fatalf("http server on a custom port must be reachable, got %q (%s)", got.Verdict, got.Detail)
+	}
+}
+
+// Хеш в embeddedBins обновляют руками. Если он не совпадает с содержимым
+// вшитого gz, автономная сборка падает на старте — ловим это тестом.
+func TestEmbeddedPayloadMatchesHash(t *testing.T) {
+	for _, b := range embeddedBins {
+		if b.gz == "" || b.sha256 == "" {
+			continue
+		}
+		f, err := assetsDir.Open(b.gz)
+		if err != nil {
+			t.Fatalf("%s: %v", b.name, err)
+		}
+		zr, err := gzip.NewReader(f)
+		if err != nil {
+			f.Close()
+			t.Fatalf("%s: %v", b.name, err)
+		}
+		h := sha256.New()
+		if _, err := io.Copy(h, zr); err != nil {
+			zr.Close()
+			f.Close()
+			t.Fatalf("%s: %v", b.name, err)
+		}
+		zr.Close()
+		f.Close()
+		got := fmt.Sprintf("%x", h.Sum(nil))
+		if got != b.sha256 {
+			t.Errorf("%s: embedded payload hash %s, embeddedBins has %s", b.name, got, b.sha256)
+		}
+	}
+}
+
+// Настоящий ffmpeg, настоящий muxed-файл: проверяем и детект аудио, и
+// пересборку без него, а не только строку аргументов.
+func TestNoAudioStripWithFFmpeg(t *testing.T) {
+	candidates := []string{
+		filepath.Join("clipnip-bin", "ffmpeg.exe"),
+		filepath.Join(os.Getenv("LOCALAPPDATA"), "clipnip", "bin", "ffmpeg.exe"),
+	}
+	ffmpeg := ""
+	for _, c := range candidates {
+		if fileExists(c) {
+			ffmpeg = c
+			break
+		}
+	}
+	if ffmpeg == "" {
+		t.Skip("ffmpeg not available")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "muxed.mp4")
+	cmd := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.5",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=0.5",
+		"-shortest", "-c:v", "libx264", "-c:a", "aac", src)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("test fixture generation failed: %v (%s)", err, out)
+	}
+
+	has, err := mediaHasAudio(ffmpeg, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !has {
+		t.Fatal("fixture must contain audio")
+	}
+	if err := stripAudioTrack(&Job{JobID: "t"}, ffmpeg, src); err != nil {
+		t.Fatal(err)
+	}
+	has, err = mediaHasAudio(ffmpeg, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if has {
+		t.Error("audio track must be gone")
 	}
 }

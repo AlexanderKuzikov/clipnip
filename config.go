@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -42,14 +43,28 @@ var config = struct {
 // (и затирали download_dir). В проде остаётся пустым.
 var configDirOverride string
 
+// dataDir — каталог рантайм-данных. Уважает configDirOverride: тесты не
+// должны писать ни в конфиг, ни в очередь реального пользователя.
+func dataDir() (string, error) {
+	if configDirOverride != "" {
+		return configDirOverride, nil
+	}
+	// CLIPNIP_DATA — отдельный рантайм-каталог для headless-прогонов:
+	// диагностика не должна трогать конфиг и очередь пользователя.
+	if dir := strings.TrimSpace(os.Getenv("CLIPNIP_DATA")); dir != "" {
+		return dir, nil
+	}
+	base, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, "clipnip"), nil
+}
+
 func configPath() (string, error) {
-	dir := configDirOverride
-	if dir == "" {
-		base, err := os.UserCacheDir()
-		if err != nil {
-			return "", err
-		}
-		dir = filepath.Join(base, "clipnip")
+	dir, err := dataDir()
+	if err != nil {
+		return "", err
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
@@ -58,8 +73,8 @@ func configPath() (string, error) {
 }
 
 func localAppDataDir() string {
-	base, _ := os.UserCacheDir()
-	return filepath.Join(base, "clipnip")
+	dir, _ := dataDir()
+	return dir
 }
 
 func loadConfig() {
@@ -72,7 +87,8 @@ func loadConfig() {
 		return
 	}
 	var c Config
-	if json.Unmarshal(data, &c) != nil {
+	if err := json.Unmarshal(data, &c); err != nil {
+		log.Printf("config: %v; using defaults", err)
 		return
 	}
 	config.Lock()
@@ -91,7 +107,11 @@ func saveConfig() {
 	if err != nil {
 		return
 	}
-	os.WriteFile(path, data, 0o600)
+	tmp := path + ".tmp"
+	if os.WriteFile(tmp, data, 0o600) != nil {
+		return
+	}
+	os.Rename(tmp, path)
 }
 
 func getDownloadDir() string {

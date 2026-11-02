@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -104,12 +105,50 @@ func webView2Installed() bool {
 	return false
 }
 
+// maxLogSize — порог ротации. Лог раньше рос бесконечно.
+const maxLogSize = 10 << 20
+
 func setupLog() (*os.File, error) {
-	f, err := os.OpenFile(logFilePath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	// На первом запуске каталога ещё нет: без MkdirAll лог молча не создаётся.
+	if err := os.MkdirAll(localAppDataDir(), 0o755); err != nil {
+		return nil, err
+	}
+	path := logFilePath()
+	if fi, err := os.Stat(path); err == nil && fi.Size() > maxLogSize {
+		os.Rename(path, path+".old")
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, err
 	}
 	return f, nil
+}
+
+// readLogTail читает только хвост файла: GET /api/log раньше тянул весь лог
+// в память, а он ничем не ограничен.
+func readLogTail(max int64) (tail []byte, truncated bool, err error) {
+	f, err := os.Open(logFilePath())
+	if err != nil {
+		return nil, false, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, false, err
+	}
+	start := int64(0)
+	if max > 0 && fi.Size() > max {
+		start = fi.Size() - max
+		truncated = true
+	}
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return nil, false, err
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, false, err
+	}
+	return data, truncated, nil
 }
 
 func logFilePath() string {
@@ -117,6 +156,11 @@ func logFilePath() string {
 }
 
 func fatalBox(err error) {
+	log.Printf("fatal: %v", err)
+	if headless() {
+		// В headless нет пользователя: модальное окно нависнет навсегда.
+		return
+	}
 	msgBox("ClipNip — startup error", fmt.Sprintf(
 		"ClipNip could not start:\n\n%v\n\nSee %s\\clipnip.log for details.", err, localAppDataDir()))
 }

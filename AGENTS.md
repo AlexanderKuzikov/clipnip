@@ -4,22 +4,26 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
 
 ## Commands
 
-- build: `go build -ldflags="-s -w -H windowsgui" -o clipnip.exe .` (автономная сборка, 101 МБ, всё внутри)
-- build-remote: `go build -tags clipnipremote -ldflags="-s -w -H windowsgui" -o clipnip-remote.exe .` (**7.6 МБ, ни одного встроенного PE**; компоненты — portable-папка / кэш / сервер)
-- test: `go test ./...` (и `-tags clipnipremote` при правках embed)
+- build: `go build -ldflags="-s -w -H windowsgui" -o clipnip.exe .` (автономная сборка, ~107 МБ, всё внутри)
+- build-remote: `go build -tags clipnipremote -ldflags="-s -w -H windowsgui" -o clipnip-remote.exe .` (**~8.1 МБ, ни одного встроенного PE**; компоненты — portable-папка / кэш / сервер)
+- build-portable: `go build -tags clipnipportable -ldflags="-s -w -H windowsgui" -o clipnip-portable.exe .` (**~7.6 МБ; сетевой загрузки нет вообще** — только `clipnip-bin` рядом с exe; собирается под ложные срабатывания антивирусов, ADR 012)
+- test: `go test ./...` (и `-tags clipnipremote` / `-tags clipnipportable` при правках embed)
 - vet: `go vet ./...`
-- headless-API: `$env:CLIPNIP_HEADLESS="1"; $env:CLIPNIP_PORT="8899"; .\clipnip.exe` → `http://127.0.0.1:8899/` (через curl — Invoke-RestMethod на loopback падает из-за прокси)
+- headless-API: `$env:CLIPNIP_HEADLESS="1"; $env:CLIPNIP_PORT="8899"; $env:CLIPNIP_DATA="$env:TEMP\clipnip-data"; .\clipnip.exe` → `http://127.0.0.1:8899/` (через curl — Invoke-RestMethod на loopback падает из-за прокси). `CLIPNIP_DATA` уводит конфиг/очередь/лог из реального `%LOCALAPPDATA%\clipnip`.
 
 ## Conventions
 
 - Коммиты прямо в main, повелительное наклонение, ≤72 символа.
 - UI — в `web/`, вшивается через `//go:embed web`; шрифты локальные (без внешних CDN).
 - Сборка ТОЛЬКО с `-H windowsgui` — иначе чёрное консольное окно.
-- Набор встроенных бинарников зависит от тега сборки: `assetsDir` живёт в `embed_embedded.go` (все три) / `embed_remote.go` (только интерфейс), пути к архивам — в `bins_embedded.go` / `bins_remote.go`. Встраивать всё через `//go:embed embedded` нельзя: каталог тянется целиком.
+- Набор встроенных бинарников зависит от тега сборки: `assetsDir` живёт в `embed_embedded.go` (все три) / `embed_thin.go` (только интерфейс; теги `clipnipremote || clipnipportable`), пути к архивам — в `bins_embedded.go` / `bins_thin.go`. Встраивать всё через `//go:embed embedded` нельзя: каталог тянется целиком.
+- Тег `clipnipportable` отличается от `clipnipremote` одной константой `allowRemoteFetch` (`fetchflag_off.go` / `fetchflag_on.go`). В portable ветка загрузки unreachable, поэтому линкер выкидывает `loadManifest` и `downloadComponent` — в exe не остаётся строки `manifest.json`. **Это и есть смысл тега; проверять надо строками, а не размером.**
 
 ## Structure
 
 - `main.go` — WebView + loopback-сервер; `CLIPNIP_PORT`/`CLIPNIP_HEADLESS` — для отладки.
+- `fs.go` — постоянная навигация по папкам (контракт из MuteNip): `GET /api/fs/drives` (локальные диски, без сетевых) и `GET /api/fs/list?path=` (ленивый список подпапок). UI — левая панель, выбор папки кликом сохраняет `download_dir`.
+- `noaudio.go` — режим `video_noaudio`: после скачивания проверяет наличие аудио через ffmpeg и при необходимости пересобирает файл `-map 0 -map -0:a -c copy` без перекодирования. Для video-only потока — no-op.
 - `api.go` — HTTP-контракт (унаследован от ReClip/app.py):
   - `POST /api/info` — метаданные + качества (таймаут 45 c)
   - `POST /api/download` — очередь (дедуп sha1 url|mode|format_id)
@@ -39,7 +43,8 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
 - `persist.go` — `queue.json` (состав очереди, не стейт-машина): `persistQueue` (вызывается из `defer` в `runDownload`, из `cancelJob` и при постановке в очередь), `restoreQueue` (до старта воркеров, с валидацией записей).
 - `embedded/*.gz` — gzip-архивы yt-dlp.exe, ffmpeg.exe и deno.exe, вшиты через `//go:embed`. Распаковка в `%LOCALAPPDATA%\clipnip\bin\` при первом запуске (ensureBins). **Каждый компонент сверяется по SHA-256 с эталоном из `embeddedBins`; несовпадение → перераспаковка из embed, запуск подменённого файла исключён.** Сверить хеш надо после замены `.gz`, иначе старт упадёт. ffmpeg сверху не проверяется — под него оставлен ручной путь обновления. Подробности — `SECURITY.md`.
 - `jsRuntimeArgs()` — `--js-runtimes deno:<путь>`; deno нужен для yt-dlp-ejs. **Проверено:** без него JS-рантайма на машине нет вообще (node/bun/quickjs отсутствуют), и при этом yt-dlp и так находит deno рядом со своим exe — флаг держим как страховку, а не как необходимое условие. deno опционален: в `requiredComponents` его нет, страховка, а не условие работы.
-- `fetch.go` — разрешение компонентов: `resolveComponents` (portable → кэш → embed → сервер), реестр `componentPath`/`ytdlpPath` (вызовы идут по фактическим путям, а не по кэшу — иначе portable-папка находилась, а запускалась пустая кэш-копия), `loadManifest`, `downloadComponent` (только https), `fetchAndVerify` (атомарная установка по SHA-256), `componentsReady`/`missingComponents`. **Недостающие компоненты не фатальны** — иначе окно с ошибкой просит зайти в настройки, в которые попасть нельзя.
+- `fetch.go` — разрешение компонентов: portable → встроенная копия → кэш/сервер, **один раз за процесс** (`ensureBins`/`refreshComponents` под `componentsMu`); повторные вызовы из каждого скачивания больше не пересчитывают хеши и не ходят за манифестом. `componentPath`/`ytdlpPath` — реестр фактических путей; `loadManifest`, `downloadComponent` (только https), `fetchAndVerify` (атомарная установка по SHA-256 и размеру), `componentsReady`/`missingComponents`. **Недостающие компоненты не фатальны** — иначе окно с ошибкой просит зайти в настройки, в которые попасть нельзя.
+- Режимы загрузки (`jobs.go`): `video`, `video_noaudio`, `m4a`, `mp3_128`, `mp3_192`; `validMode`/`isVideoMode` — единая проверка для API и восстановления очереди. Для выбранного качества fallback обязан сохранять видео: `<id>+bestaudio[ext=m4a]/<id>+bestaudio/<id>` (см. грабли 25). У `video_noaudio` имя файла получает суффикс ` (no audio)`.
 
 ## Обновление вшитых бинарников
 
@@ -48,14 +53,14 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
 `/usr/local/bin/update-clipnip-bins.sh` на `sat` (исходник — `scripts/`).
 Хеши пересчитываются там же, вручную ничего трогать не надо.
 
-Порядок ниже нужен только для **автономной** сборки (101 МБ), где всё лежит
+Порядок ниже нужен только для **автономной** сборки (~107 МБ), где всё лежит
 внутри exe.
 
-1. Скачать свежие `yt-dlp.exe`, `ffmpeg.exe` (GitHub / gyan.dev) и `deno.exe` (релиз denoland/deno, ассет `deno-x86_64-pc-windows-msvc.zip`). Только стабильный релиз yt-dlp — см. ADR 006 про канал.
+1. Скачать свежие `yt-dlp.exe` (nightly, ADR 006), `ffmpeg.exe` (GitHub / gyan.dev) и `deno.exe` (релиз denoland/deno, ассет `deno-x86_64-pc-windows-msvc.zip`).
 2. Запаковать в `embedded/` (имена: `yt-dlp.exe.gz`, `ffmpeg.exe.gz`, `deno.exe.gz`). `gzip` в PowerShell нет — пакуй любым gzip-инструментом (git bash, 7-Zip, python `gzip`). deno.exe уже упакован: gzip даёт 42.6 MB из 97.5 MB, экономить не на чем.
 3. **Поднять константы `ytdlpVersion` и `denoVersion` в `ytdlp.go`** под новые версии.
-4. **Обновить SHA-256 в `embeddedBins`** для yt-dlp и deno. Хеш берётся с уже распакованного файла в `%LOCALAPPDATA%\clipnip\bin\`. Забытый шаг — приложение не стартует: сверка целостности отвергнет расхождение.
-4. Пересобрать exe. ffmpeg обновлять не обязательно (yt-dlp обновляется чаще).
+4. **Обновить SHA-256 в `embeddedBins`** для yt-dlp и deno. Хеш берётся с уже распакованного файла в `%LOCALAPPDATA%\clipnip\bin\`. Забытый шаг — приложение не стартует: сверка целостности отвергнет расхождение. Тест `TestEmbeddedPayloadMatchesHash` ловит это до сборки.
+5. Пересобрать exe. ffmpeg обновлять не обязательно (yt-dlp обновляется чаще).
 
 ## Do NOT touch
 
@@ -94,6 +99,12 @@ Desktop-загрузчик медиа (Go + WebView2 + yt-dlp). Наследни
 22. **При склейке счётчики считаются по компонентам.** Видео и аудио качаются отдельными файлами, каждый с нуля: начало нового компонента определяется откатом `downloaded_bytes`. В UI — `DoneTotal + Cur*`. Наивное «взять последний тик» показывало размер аудиофайла вместо готового ролика.
 23. **`msgBox` в headless висель вечно.** Модальное окно блокируется на клике, а интерактивного пользователя нет — в headless только лог (обнаружено на прогоне single-instance).
 24. **Очередь на диске — состав, а не состояние.** Формат файла при обновлении надо валидировать при восстановлении (мусорные URL и режимы отбрасываются).
+25. **X отдаёт аудио как HLS/mp4, а не m4a.** Старый fallback `<id>+bestaudio[ext=m4a]/bestaudio` выбирал **только звук**: первая ветка не находила m4a, вторая скачивала bestaudio. Любой fallback для выбранного качества обязан сохранять видео: `<id>+bestaudio[ext=m4a]/<id>+bestaudio/<id>`. Проверено живым постом X: 720p + AAC.
+26. **`ensureBins` нельзя вызывать из каждого скачивания.** Резолв — один раз на процесс (`sync`/`componentsMu`), иначе каждый джоб хеширует ~215 МБ и ходит за манифестом; параллельные воркеры гоняются за общий реестр путей. Явный refresh — только из настроек.
+27. **Манифест компонентов не грузить, если всё есть локально.** Portable-папка или встроенные копии — сеть не нужна; 10-секундный таймаут на старте из-за недоступного сервера недопустим.
+28. **Локальный API должен проверять Host и Origin.** Сторонняя страница могла text/plain POST без preflight переключить сервер компонентов (RCE) или поставить загрузку; DNS rebinding даёт совпадающие Origin/Host. См. `sameOrigin` в `api.go`.
+29. **Режим без звука нельзя делать только выбором формата.** У части сайтов единственный формат мультиплексный (X: `http-*` содержит аудио). Проверять ffmpeg и пересобирать `-map 0 -map -0:a -c copy`; имя — с суффиксом ` (no audio)`, иначе skip считает обычное видео уже скачанным.
+30. **Тесты пишут только в temp.** `CLIPNIP_DATA`/`configDirOverride` уводят конфиг, очередь и лог; без этого прогон затирал реальную очередь (`ftp://evil/x` находился в `%LOCALAPPDATA%`).
 
 ## Места хранения
 

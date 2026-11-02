@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -41,7 +42,10 @@ func friendlyErrorBackend(err string) string {
 	switch {
 	case strings.Contains(lower, "unable to download video data"),
 		strings.Contains(lower, "unable to download api page"):
-		return "Движок не может получить поток — версия yt-dlp устарела."
+		// Не утверждаем «движок устарел»: на свежем движке та же строка
+		// означает отказ в передаче (адрес, VPN, истёкшая подпись). Точную
+		// причину называет errorHint по классу ошибки.
+		return "Сайт отдал метаданные, но отказал в передаче потока."
 	case strings.Contains(lower, "sign in to confirm"),
 		strings.Contains(lower, "http error 401"),
 		strings.Contains(lower, "http error 403"):
@@ -93,6 +97,33 @@ func playlistEntries(info map[string]any) []map[string]any {
 	return out
 }
 
+// sameOrigin закрывает браузерный CSRF: сторонний сайт мог отправить
+// text/plain POST без preflight и, например, переключить сервер компонентов
+// (а это загрузка и запуск exe). Локальные процессы без Origin не трогаем.
+// Проверка Host закрывает DNS rebinding: evil.com, указывающий на 127.0.0.1,
+// даёт совпадающие Origin и Host, но недопустимый Host.
+func sameOrigin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host, _, err := net.SplitHostPort(r.Host)
+		if err != nil || (host != "127.0.0.1" && host != "::1" && !strings.EqualFold(host, "localhost")) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "Unexpected Host header"})
+			return
+		}
+		if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "Cross-site request refused"})
+			return
+		}
+		if origin := r.Header.Get("Origin"); origin != "" {
+			u, err := url.Parse(origin)
+			if err != nil || !strings.EqualFold(u.Host, r.Host) {
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": "Cross-origin request refused"})
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func newAPI() http.Handler {
 	mux := http.NewServeMux()
 
@@ -131,10 +162,13 @@ func newAPI() http.Handler {
 			return
 		}
 		version, hasFFmpeg, hasDeno := probeEngine()
+		stale := version != "" && ytdlpVersion != "" &&
+			versionDate(version) < versionDate(ytdlpVersion)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"version":  version,
 			"embedded": ytdlpVersion,
-			"stale":    version != "" && version != ytdlpVersion,
+			"stale":    stale,
+			"differs":  version != "" && version != ytdlpVersion,
 			"ffmpeg":   hasFFmpeg,
 			"deno":     hasDeno,
 		})
@@ -253,17 +287,16 @@ func newAPI() http.Handler {
 	mux.HandleFunc("/api/log", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			data, err := os.ReadFile(logFilePath())
+			data, truncated, err := readLogTail(24 * 1024)
 			if err != nil {
 				writeJSON(w, http.StatusOK, map[string]string{
 					"path": logFilePath(), "tail": "log is empty",
 				})
 				return
 			}
-			const maxTail = 24 * 1024
 			tail := string(data)
-			if len(tail) > maxTail {
-				tail = "...(truncated)...\n" + tail[len(tail)-maxTail:]
+			if truncated {
+				tail = "...(truncated)...\n" + tail
 			}
 			writeJSON(w, http.StatusOK, map[string]string{"path": logFilePath(), "tail": tail})
 
@@ -282,13 +315,15 @@ func newAPI() http.Handler {
 	// Статус компонентов: откуда взят каждый и что с ним не так.
 	mux.HandleFunc("/api/components", func(w http.ResponseWriter, r *http.Request) {
 		snapshot := func() map[string]any {
+			states, ready, missing, problem := componentsSnapshot()
 			return map[string]any{
 				"url":        componentsBaseURL(),
 				"portable":   portableBinDir(),
-				"components": componentStates,
-				"ready":      componentsReady(requiredComponents()),
-				"missing":    missingComponents(requiredComponents()),
-				"problem":    componentsProblem,
+				"components": states,
+				"ready":      ready,
+				"missing":    missing,
+				"problem":    problem,
+				"can_fetch":  allowRemoteFetch,
 			}
 		}
 		switch r.Method {
@@ -318,7 +353,9 @@ func newAPI() http.Handler {
 			// именно этот путь восстанавливает приложение, у которого сняли
 			// папку с компонентами
 			if req.Refresh {
-				ensureBins()
+				if err := refreshComponents(); err != nil {
+					log.Printf("components refresh: %v", err)
+				}
 			}
 			writeJSON(w, http.StatusOK, snapshot())
 
@@ -326,6 +363,11 @@ func newAPI() http.Handler {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
 		}
 	})
+
+	// Постоянная панель навигации по папкам (контракт из MuteNip):
+	// диски и ленивый список подпапок, без модальных диалогов.
+	mux.HandleFunc("/api/fs/drives", handleFSDrives)
+	mux.HandleFunc("/api/fs/list", handleFSList)
 
 	mux.HandleFunc("/api/settings", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -462,7 +504,7 @@ func newAPI() http.Handler {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Only http/https URLs are allowed"})
 			return
 		}
-		if mode != "video" && !audioModeRe.MatchString(mode) {
+		if !validMode(mode) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid mode"})
 			return
 		}
@@ -470,7 +512,7 @@ func newAPI() http.Handler {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid format id"})
 			return
 		}
-		if mode != "video" {
+		if !isVideoMode(mode) {
 			formatID = ""
 		}
 
@@ -587,16 +629,28 @@ func newAPI() http.Handler {
 	})
 
 	mux.HandleFunc("/api/pauseall", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
+			return
+		}
 		pauseAllJobs()
 		writeJSON(w, http.StatusOK, map[string]string{"status": "paused"})
 	})
 
 	mux.HandleFunc("/api/resumeall", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
+			return
+		}
 		resumeAllJobs()
 		writeJSON(w, http.StatusOK, map[string]string{"status": "resumed"})
 	})
 
 	mux.HandleFunc("/api/cancelall", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
+			return
+		}
 		cancelAllJobs()
 		writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
 	})
@@ -604,23 +658,37 @@ func newAPI() http.Handler {
 	mux.HandleFunc("/api/open/", func(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimPrefix(r.URL.Path, "/api/open/")
 		job := getJob(id)
-		if job == nil || job.Status != "done" || job.File == "" || !fileExists(job.File) {
+		if job == nil {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "File not ready"})
 			return
 		}
-		openInExplorer(job.File)
+		job.mu.RLock()
+		status, file := job.Status, job.File
+		job.mu.RUnlock()
+		if status != "done" || file == "" || !fileExists(file) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "File not ready"})
+			return
+		}
+		openInExplorer(file)
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
 	mux.HandleFunc("/api/file/", func(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimPrefix(r.URL.Path, "/api/file/")
 		job := getJob(id)
-		if job == nil || job.Status != "done" || job.File == "" || !fileExists(job.File) {
+		if job == nil {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "File not ready"})
 			return
 		}
-		w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(job.Filename))
-		http.ServeFile(w, r, job.File)
+		job.mu.RLock()
+		status, file, filename := job.Status, job.File, job.Filename
+		job.mu.RUnlock()
+		if status != "done" || file == "" || !fileExists(file) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "File not ready"})
+			return
+		}
+		w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(filename))
+		http.ServeFile(w, r, file)
 	})
 
 	return mux

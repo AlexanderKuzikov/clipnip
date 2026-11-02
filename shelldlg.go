@@ -6,16 +6,16 @@ import (
 )
 
 var (
-	shell32 = syscall.NewLazyDLL("shell32.dll")
-	procBrowseFolder = shell32.NewProc("SHBrowseForFolderW")
+	shell32               = syscall.NewLazyDLL("shell32.dll")
+	procBrowseFolder      = shell32.NewProc("SHBrowseForFolderW")
 	procGetPathFromIDList = shell32.NewProc("SHGetPathFromIDListW")
-	ole32 = syscall.NewLazyDLL("ole32.dll")
-	procCoTaskMemFree = ole32.NewProc("CoTaskMemFree")
+	ole32                 = syscall.NewLazyDLL("ole32.dll")
+	procCoTaskMemFree     = ole32.NewProc("CoTaskMemFree")
 )
 
 const (
-	bifReturnOnlyFSDirs  = 0x0001
-	bifNewDialogStyle    = 0x0040
+	bifReturnOnlyFSDirs = 0x0001
+	bifNewDialogStyle   = 0x0040
 )
 
 type browseInfo struct {

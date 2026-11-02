@@ -40,20 +40,20 @@ func main() {
 	loadConfig()
 	cleanupStaleParts()
 	restoreQueue()
-	startWorkers()
-	startWatchdog()
 
-	// Недостающие компоненты не мешают старту: без них приложение поднимается
-	// и даёт починить себя в настройках. Фатальна только неисправимая ошибка
-	// самой распаковки.
+	// Компоненты разрешаются ДО старта воркеров: иначе восстановленная
+	// очередь сразу шла в runYtDlp и параллельно с main вызывала resolve,
+	// гоняясь за глобальный реестр и пересчитывая хеши.
 	if err := ensureBins(); err != nil {
 		log.Printf("bootstrap failed: %v", err)
 		fatalBox(err)
 		return
 	}
-	if componentsProblem != "" {
-		log.Printf("components incomplete: %s", componentsProblem)
+	if problem := componentsProblemText(); problem != "" {
+		log.Printf("components incomplete: %s", problem)
 	}
+	startWorkers()
+	startWatchdog()
 	if version, hasFFmpeg, hasDeno := probeEngine(); version != "" {
 		if version != ytdlpVersion {
 			log.Printf("engine: yt-dlp %s (embedded %s, differs)", version, ytdlpVersion)
@@ -99,7 +99,7 @@ func main() {
 		}
 	}
 
-	srv := &http.Server{Handler: newAPI()}
+	srv := &http.Server{Handler: sameOrigin(newAPI())}
 	go srv.Serve(listener)
 
 	addr := listener.Addr().String()
