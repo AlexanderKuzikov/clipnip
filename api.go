@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
@@ -281,6 +282,37 @@ func newAPI() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok": false, "kind": kind, "detail": friendlyErrorBackend(msg), "error": msg,
 		})
+	})
+
+	// Снимок cookies: Chromium держит базу без sharing, поэтому при открытом
+	// браузере прямое чтение невозможно. Копия делается один раз при закрытом
+	// браузере и дальше работает при открытом.
+	mux.HandleFunc("/api/cookies/snapshot", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
+			return
+		}
+		var req struct {
+			Spec string `json:"spec"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		spec := strings.TrimSpace(req.Spec)
+		if spec == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Choose a browser profile first"})
+			return
+		}
+		snapshot, err := snapshotCookieProfile(spec)
+		if err != nil {
+			status := http.StatusBadRequest
+			msg := err.Error()
+			if errors.Is(err, errCookieDBLocked) {
+				status = http.StatusConflict
+				msg = "The browser is using its cookie database. Close it completely, then press Use a copy again."
+			}
+			writeJSON(w, status, map[string]string{"error": msg})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"spec": snapshot})
 	})
 
 	// Хвост лога: диагностика не должна требовать захода в AppData.

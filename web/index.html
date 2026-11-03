@@ -1061,11 +1061,15 @@
         </div>
         <div class="auth-actions">
           <button class="settings-btn" onclick="testCookies()">Test</button>
+          <button class="settings-btn" onclick="snapshotCookies()">Use a copy</button>
           <span class="auth-note" id="ckTestResult"></span>
         </div>
         <p class="auth-hint">
           Sites that require a logged-in session refuse anonymous requests.
           Any Chromium browser works by pointing the spec at its profile folder.
+          If the browser locks its cookie database, close it once and press
+          “Use a copy”: downloads will then work while the browser is open.
+          Refresh the copy after changing accounts.
         </p>
       </div>
     </div>
@@ -1457,11 +1461,17 @@
       bsel.innerHTML = '<option value="">browser…</option>' + found.map(b =>
         `<option value="${esc(b.name)}">${esc(b.label)}${b.profiles && b.profiles.length ? '' : ' (no profiles found)'}</option>`
       ).join('');
+      const currentSpec = cfg.spec || '';
+      const matching = found.find(b =>
+        b.suggest === currentSpec || (b.profiles || []).some(p => p.spec === currentSpec)
+      );
+      if (matching) bsel.value = matching.name;
       if (!found.length) {
         document.getElementById('ckBrowserNote').textContent =
           'No known browser detected — use the spec field below.';
-      } else if (!cfg.spec) {
-        document.getElementById('ckBrowserNote').textContent = '';
+      } else if (currentSpec.includes('\\clipnip\\cookies\\')) {
+        document.getElementById('ckBrowserNote').textContent =
+          'Using a cookie copy. Refresh it after changing accounts.';
       } else {
         document.getElementById('ckBrowserNote').textContent = '';
       }
@@ -1481,7 +1491,8 @@
 
     function syncProfileSelect() {
       const psel = document.getElementById('ckProfile');
-      const b = browserByName(specBrowserName());
+      const selected = document.getElementById('ckBrowser').value;
+      const b = browserByName(selected) || browserByName(specBrowserName());
       const profiles = (b && b.profiles) || [];
       psel.innerHTML = '<option value="">profile…</option>' + profiles.map(p =>
         `<option value="${esc(p.spec)}">${esc(p.name)}</option>`
@@ -1561,6 +1572,32 @@
         setCookieTest(d.detail || (d.ok ? 'works' : 'failed'), d.ok ? 'ok' : 'bad');
       } catch (err) {
         setCookieTest(err.message || 'Test failed', 'bad');
+      }
+    }
+
+    async function snapshotCookies() {
+      const spec = document.getElementById('ckSpec').value.trim();
+      if (!spec) { setCookieTest('Fill in the browser spec first', 'bad'); return; }
+      setCookieTest('Copying cookies...', '');
+      try {
+        const res = await fetch('/api/cookies/snapshot', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ spec }),
+        });
+        const d = await res.json();
+        if (!res.ok || d.error) {
+          setCookieTest(d.error || 'Could not copy cookies', 'bad');
+          return;
+        }
+        document.getElementById('ckSpec').value = d.spec;
+        document.getElementById('ckEnabled').checked = true;
+        if (!await saveCookies(true)) return;
+        setCookieTest('Cookie copy created. Works while the browser is open.', 'ok');
+        document.getElementById('ckBrowserNote').textContent =
+          'Using a cookie copy. Refresh it after changing accounts.';
+      } catch (err) {
+        setCookieTest(err.message || 'Could not copy cookies', 'bad');
       }
     }
 

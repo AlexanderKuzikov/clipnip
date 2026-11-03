@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"sort"
@@ -44,6 +45,7 @@ var cookieBrowsers = []struct{ name, label string }{
 	{"vivaldi", "Vivaldi"},
 	{"opera", "Opera"},
 	{"chromium", "Chromium"},
+	{"yandex", "Yandex Browser"},
 	{"whale", "Naver Whale"},
 }
 
@@ -72,6 +74,10 @@ func chromiumDirs(name string) string {
 		return filepath.Join(roaming, "Opera Software", "Opera Stable")
 	case "vivaldi":
 		return filepath.Join(local, "Vivaldi", "User Data")
+	case "yandex":
+		// Яндекс — Chromium-форк, yt-dlp не знает его по имени, поэтому
+		// спецификация строится через chromium:<путь-к-профилю>.
+		return filepath.Join(local, "Yandex", "YandexBrowser", "User Data")
 	case "whale":
 		return filepath.Join(local, "Naver", "Naver Whale", "User Data")
 	}
@@ -99,7 +105,33 @@ func profilesByMTime(profiles []profileInfo) []profileInfo {
 	return profiles
 }
 
-func detectChromium(name, dir string) []profileInfo {
+// chromiumProfileNames — человеческие имена профилей из Local State.
+// Это только подсказка для UI: если info_cache пуст, покажем имя каталога.
+func chromiumProfileNames(dir string) map[string]string {
+	names := map[string]string{}
+	data, err := os.ReadFile(filepath.Join(dir, "Local State"))
+	if err != nil {
+		return names
+	}
+	var state struct {
+		Profile struct {
+			InfoCache map[string]struct {
+				Name string `json:"name"`
+			} `json:"info_cache"`
+		} `json:"profile"`
+	}
+	if json.Unmarshal(data, &state) != nil {
+		return names
+	}
+	for dirName, info := range state.Profile.InfoCache {
+		if strings.TrimSpace(info.Name) != "" {
+			names[dirName] = strings.TrimSpace(info.Name)
+		}
+	}
+	return names
+}
+
+func detectChromium(name, dir string, pathSpec bool) []profileInfo {
 	// Chromium: профиль — каталог с Network/Cookies, ключ DPAPI лежит в
 	// Local State уровнем выше (именно поэтому для произвольного форка
 	// спецификация должна указывать на каталог профиля, а не на User Data).
@@ -110,6 +142,7 @@ func detectChromium(name, dir string) []profileInfo {
 	if err != nil {
 		return nil
 	}
+	names := chromiumProfileNames(dir)
 	out := []profileInfo{}
 	for _, e := range entries {
 		if !e.IsDir() {
@@ -120,9 +153,19 @@ func detectChromium(name, dir string) []profileInfo {
 		if err != nil {
 			continue
 		}
+		spec := name + ":" + e.Name()
+		if pathSpec {
+			// yt-dlp не знает Yandex и прочие форки по имени; путь к профилю
+			// работает через Chromium-парсер.
+			spec = "chromium:" + filepath.Join(dir, e.Name())
+		}
+		label := names[e.Name()]
+		if label == "" {
+			label = e.Name()
+		}
 		out = append(out, profileInfo{
-			Name:  e.Name(),
-			Spec:  name + ":" + e.Name(),
+			Name:  label,
+			Spec:  spec,
 			MTime: st.ModTime().UTC().Format(time.RFC3339),
 		})
 	}
@@ -174,13 +217,15 @@ func detectCookieBrowsers() []browserInfo {
 				}
 			}
 			if info.Found && !info.NoProf {
-				info.Profiles = detectChromium(b.name, info.Dir)
+				info.Profiles = detectChromium(b.name, info.Dir, b.name == "yandex")
 			}
 		}
 		if len(info.Profiles) > 0 {
 			info.Found = true
 			info.Suggest = info.Profiles[0].Spec
-		} else if info.Found {
+		} else if info.Found && b.name != "yandex" {
+			// Просто «yandex» yt-dlp не понимает; без найденного профиля
+			// предлагать нечего.
 			info.Suggest = info.Name
 		}
 		out = append(out, info)

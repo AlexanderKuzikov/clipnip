@@ -1516,21 +1516,145 @@ func TestNoAudioStripWithFFmpeg(t *testing.T) {
 		t.Skipf("test fixture generation failed: %v (%s)", err, out)
 	}
 
-	has, err := mediaHasAudio(ffmpeg, src)
+	info, err := probeMedia(ffmpeg, src)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !has {
+	if !info.HasAudio {
 		t.Fatal("fixture must contain audio")
 	}
-	if err := stripAudioTrack(&Job{JobID: "t"}, ffmpeg, src); err != nil {
+	if err := remuxNoAudio(&Job{JobID: "t"}, ffmpeg, src); err != nil {
 		t.Fatal(err)
 	}
-	has, err = mediaHasAudio(ffmpeg, src)
+	info, err = probeMedia(ffmpeg, src)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if has {
+	if info.HasAudio {
 		t.Error("audio track must be gone")
 	}
+}
+
+// Сырой DASH-контейнер без аудио — валидный H.264, но часть плееров его не
+// открывает. Ремукс обязателен даже при отсутствии аудио: он делает isom.
+func TestRemuxNoAudioNormalizesDashContainer(t *testing.T) {
+	candidates := []string{
+		filepath.Join("clipnip-bin", "ffmpeg.exe"),
+		filepath.Join(os.Getenv("LOCALAPPDATA"), "clipnip", "bin", "ffmpeg.exe"),
+	}
+	ffmpeg := ""
+	for _, c := range candidates {
+		if fileExists(c) {
+			ffmpeg = c
+			break
+		}
+	}
+	if ffmpeg == "" {
+		t.Skip("ffmpeg not available")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "dash.mp4")
+	cmd := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.5",
+		"-c:v", "libx264", "-an", "-brand", "dash", src)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("dash fixture generation failed: %v (%s)", err, out)
+	}
+	info, err := probeMedia(ffmpeg, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.MajorBrand != "dash" {
+		t.Skipf("fixture brand = %q, want dash", info.MajorBrand)
+	}
+	if err := remuxNoAudio(&Job{JobID: "t"}, ffmpeg, src); err != nil {
+		t.Fatal(err)
+	}
+	info, err = probeMedia(ffmpeg, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.MajorBrand == "dash" {
+		t.Error("DASH container was not normalized")
+	}
+	if info.HasAudio {
+		t.Error("video-only fixture must stay without audio")
+	}
+}
+
+// Yandex не знает yt-dlp по имени, поэтому профиль должен выражаться
+// chromium:<путь-к-профилю>, а не yandex:<имя>.
+func TestDetectYandexProfileUsesChromiumPathSpec(t *testing.T) {
+	dir := t.TempDir()
+	profile := filepath.Join(dir, "Default")
+	if err := os.MkdirAll(filepath.Join(profile, "Network"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profile, "Network", "Cookies"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state := `{"profile":{"info_cache":{"Default":{"name":"Пользователь 1"}}}}`
+	if err := os.WriteFile(filepath.Join(dir, "Local State"), []byte(state), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	profiles := detectChromium("yandex", dir, true)
+	if len(profiles) != 1 {
+		t.Fatalf("want 1 profile, got %d", len(profiles))
+	}
+	wantSpec := "chromium:" + profile
+	if profiles[0].Spec != wantSpec {
+		t.Errorf("spec = %q, want %q", profiles[0].Spec, wantSpec)
+	}
+	if profiles[0].Name != "Пользователь 1" {
+		t.Errorf("display name = %q", profiles[0].Name)
+	}
+}
+
+func TestSnapshotCookieProfile(t *testing.T) {
+	source := t.TempDir()
+	profile := filepath.Join(source, "Default")
+	if err := os.MkdirAll(filepath.Join(profile, "Network"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cookies := []byte("encrypted-cookie-db")
+	if err := os.WriteFile(filepath.Join(profile, "Network", "Cookies"), cookies, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state := []byte(`{"os_crypt":{"encrypted_key":"test"}}`)
+	if err := os.WriteFile(filepath.Join(source, "Local State"), state, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	oldOverride := configDirOverride
+	configDirOverride = t.TempDir()
+	t.Cleanup(func() { configDirOverride = oldOverride })
+
+	spec, err := snapshotCookieProfile("chromium:" + profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotDir, _, err := resolveCookieProfile(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(snapshotDir, "Network", "Cookies"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(cookies) {
+		t.Errorf("snapshot cookies = %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(snapshotDir), "Local State")); err != nil {
+		t.Errorf("Local State not copied: %v", err)
+	}
+}
+
+func TestYandexIsDetected(t *testing.T) {
+	for _, b := range cookieBrowsers {
+		if b.name == "yandex" {
+			return
+		}
+	}
+	t.Error("yandex must be in cookieBrowsers")
 }

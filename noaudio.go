@@ -16,40 +16,55 @@ import (
 // Поэтому результат проверяется ffmpeg и при наличии аудио пересобирается
 // без перекодирования (-map 0 -map -0:a -c copy), как в MuteNip.
 
-var audioStreamRe = regexp.MustCompile(`(?m)^\s*Stream #\d+:\d+.*: Audio:`)
+var (
+	audioStreamRe = regexp.MustCompile(`(?m)^\s*Stream #\d+:\d+.*: Audio:`)
+	majorBrandRe  = regexp.MustCompile(`(?m)^\s*major_brand\s*:\s*(\S+)`)
+)
 
-func mediaHasAudio(ffmpeg, path string) (bool, error) {
+type mediaInfo struct {
+	HasAudio   bool
+	MajorBrand string
+}
+
+// probeMedia один раз читает заголовки ffmpeg: наличие аудио и контейнер.
+// Второй запуск нужен, чтобы отличить сырой DASH (`major_brand: dash`) от
+// обычного MP4: часть плееров такой файл не открывает даже без аудио.
+func probeMedia(ffmpeg, path string) (mediaInfo, error) {
 	cmd := exec.Command(ffmpeg, "-hide_banner", "-nostdin", "-i", path)
 	cmd.SysProcAttr = noWindow()
 	var errBuf limitedBuffer
 	cmd.Stdout = nil
 	cmd.Stderr = &errBuf
 	if err := cmd.Start(); err != nil {
-		return false, err
+		return mediaInfo{}, err
 	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	select {
 	case runErr := <-done:
 		if runErr == nil && errBuf.String() == "" {
-			return false, errors.New("ffmpeg returned no stream information")
+			return mediaInfo{}, errors.New("ffmpeg returned no stream information")
 		}
 	case <-time.After(30 * time.Second):
 		killTree(cmd.Process.Pid)
 		<-done
-		return false, errors.New("ffmpeg probe timed out")
+		return mediaInfo{}, errors.New("ffmpeg probe timed out")
 	}
 	out := errBuf.String()
 	if out == "" {
-		return false, errors.New("ffmpeg returned no stream information")
+		return mediaInfo{}, errors.New("ffmpeg returned no stream information")
 	}
 	lower := strings.ToLower(out)
 	if strings.Contains(lower, "invalid data") ||
 		strings.Contains(lower, "no such file") ||
 		strings.Contains(lower, "moov atom not found") {
-		return false, errors.New("ffmpeg could not read the downloaded file")
+		return mediaInfo{}, errors.New("ffmpeg could not read the downloaded file")
 	}
-	return audioStreamRe.MatchString(out), nil
+	info := mediaInfo{HasAudio: audioStreamRe.MatchString(out)}
+	if m := majorBrandRe.FindStringSubmatch(out); m != nil {
+		info.MajorBrand = strings.ToLower(m[1])
+	}
+	return info, nil
 }
 
 func ensureNoAudio(job *Job, path string) error {
@@ -61,17 +76,20 @@ func ensureNoAudio(job *Job, path string) error {
 	if ffmpeg == "" {
 		return errors.New("ffmpeg is not available")
 	}
-	hasAudio, err := mediaHasAudio(ffmpeg, path)
+	info, err := probeMedia(ffmpeg, path)
 	if err != nil {
 		return fmt.Errorf("probe streams: %w", err)
 	}
-	if !hasAudio {
+	// Обычный MP4 без аудио уже пригоден. Ремукс нужен, если аудио есть или
+	// контейнер сырой DASH: Windows-плееры и телевизоры такие файлы часто
+	// не показывают, хотя размер и потоки корректны.
+	if !info.HasAudio && info.MajorBrand != "dash" {
 		return nil
 	}
-	return stripAudioTrack(job, ffmpeg, path)
+	return remuxNoAudio(job, ffmpeg, path)
 }
 
-func stripAudioTrack(job *Job, ffmpeg, path string) error {
+func remuxNoAudio(job *Job, ffmpeg, path string) error {
 	ext := filepath.Ext(path)
 	tmp := strings.TrimSuffix(path, ext) + ".na.tmp" + ext
 	os.Remove(tmp)
@@ -80,8 +98,13 @@ func stripAudioTrack(job *Job, ffmpeg, path string) error {
 		"-i", path,
 		"-map", "0", "-map", "-0:a", "-c", "copy",
 		"-loglevel", "error",
-		tmp,
 	}
+	if strings.EqualFold(ext, ".mp4") || strings.EqualFold(ext, ".m4v") {
+		// Normal MP4 with the index at the front: DASH-branded output is not
+		// accepted by some players even when the streams are valid.
+		args = append(args, "-movflags", "+faststart")
+	}
+	args = append(args, tmp)
 	if err := runFFmpegWithJob(job, ffmpeg, args, 30*time.Minute); err != nil {
 		os.Remove(tmp)
 		return err
