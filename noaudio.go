@@ -8,7 +8,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
+	"unsafe"
 )
 
 // Режим «видео без звука». yt-dlp умеет выбрать video-only поток, но не на
@@ -89,9 +91,57 @@ func ensureNoAudio(job *Job, path string) error {
 	return remuxNoAudio(job, ffmpeg, path)
 }
 
+// spaceError — ремуксу нужна полная копия файла рядом с исходником, и если
+// места на томе не хватает, ffmpeg падает с ENOSPC уже после многочасовой
+// загрузки. Отдельный тип даёт UI точные цифры и не даёт классификатору
+// принять это за сетевой сбой и уйти в ретраи.
+type spaceError struct {
+	Need uint64
+	Free uint64
+	Path string
+}
+
+func (e *spaceError) Error() string {
+	return fmt.Sprintf("not enough free space: need %s, free %s on %s",
+		humanBytes(int64(e.Need)), humanBytes(int64(e.Free)), filepath.VolumeName(e.Path))
+}
+
+var procGetDiskFreeSpaceExW = kernel32.NewProc("GetDiskFreeSpaceExW")
+
+// diskFree — сколько байт доступно вызывающему на томе, где лежит путь.
+// x/sys/windows ради одной функции не тянем: проект собирается без него.
+func diskFree(path string) (uint64, error) {
+	dir, err := filepath.Abs(filepath.Dir(path))
+	if err != nil {
+		return 0, err
+	}
+	p, err := syscall.UTF16PtrFromString(dir)
+	if err != nil {
+		return 0, err
+	}
+	var free, total, totalFree uint64
+	r1, _, callErr := procGetDiskFreeSpaceExW.Call(
+		uintptr(unsafe.Pointer(p)),
+		uintptr(unsafe.Pointer(&free)),
+		uintptr(unsafe.Pointer(&total)),
+		uintptr(unsafe.Pointer(&totalFree)),
+	)
+	if r1 == 0 {
+		return 0, callErr
+	}
+	return free, nil
+}
+
 func remuxNoAudio(job *Job, ffmpeg, path string) error {
 	ext := filepath.Ext(path)
 	tmp := strings.TrimSuffix(path, ext) + ".na.tmp" + ext
+	// Запас под moov и выравнивание faststart: сама копия плюс 64 МБ.
+	if fi, err := os.Stat(path); err == nil {
+		need := uint64(fi.Size()) + 64<<20
+		if free, err := diskFree(path); err == nil && free < need {
+			return &spaceError{Need: need, Free: free, Path: path}
+		}
+	}
 	os.Remove(tmp)
 	args := []string{
 		"-hide_banner", "-nostdin", "-y",

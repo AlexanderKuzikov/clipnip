@@ -31,7 +31,7 @@ const (
 	// несколько недель, и фикс приезжает в master за дни. Обоснование и
 	// риски — ADR 006. Пути к архивам объявлены в bins_embedded.go /
 	// bins_thin.go: тонкие сборки ничего не вшивают.
-	ytdlpVersion = "2026.10.29.232701"
+	ytdlpVersion = "2026.11.15.232800"
 	denoVersion  = "2.9.8"
 )
 
@@ -148,7 +148,7 @@ type binSpec struct {
 // deno присутствует только в полной сборке: в облегчённой denoGz пуст, и
 // компонент пропускается целиком.
 var embeddedBins = []binSpec{
-	{"yt-dlp.exe", ytdlpGz, ytdlpVersion, "738eb6db13e9f7887924c6857306999ff674ee4fa74cb38879ed8dacc1c137b6"},
+	{"yt-dlp.exe", ytdlpGz, ytdlpVersion, "87b929844c1c9f20aff5a8dcf5739846376da8e42e64f48c1b56df2dac4ff4c0"},
 	{"deno.exe", denoGz, denoVersion, "924397800533d3eb0ed0c889b20ad70e18b970d93acd8135bc043f425e528266"},
 	{"ffmpeg.exe", ffmpegGz, "8.1.2", "1326dde4c84ff1f96fe6b8916c5bed29e163e9b5dccf995f6f3db069d143ec5e"},
 }
@@ -297,7 +297,15 @@ func isPostprocessActivity(line string) bool {
 
 var progressTemplate = "download:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s"
 
-const stallTimeout = 20 * time.Second
+const (
+	stallTimeout = 20 * time.Second
+	// postprocessTimeout — сколько ждём склейку/ремукс без прогресса.
+	// yt-dlp печатает [Merger] один раз и молчит: на 5 ГБ чтение+запись
+	// легко превышает stallTimeout, и старый watchdog убивал процесс ровно
+	// на этом шаге, оставляя .temp.mp4 без moov. Потолок всё же нужен —
+	// на случай, если ffmpeg действительно завис.
+	postprocessTimeout = 30 * time.Minute
+)
 
 // errComponentsMissing — понятная ошибка вместо «файл не найден» из exec,
 // которую классификатор принимал за сетевой сбой и ретраил.
@@ -367,6 +375,8 @@ func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 	// stall-детект: нет прогресса дольше stallTimeout — процесс завис, убиваем
 	lastProgress := atomic.Int64{}
 	lastProgress.Store(time.Now().UnixNano())
+	// Ноль — постобработки не было; иначе unix-nano её начала.
+	postSince := atomic.Int64{}
 	stalled := atomic.Bool{}
 	stopWatch := make(chan struct{})
 	go func() {
@@ -375,6 +385,14 @@ func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 		for {
 			select {
 			case <-ticker.C:
+				// Склейка видео+аудио и ремукс идут без прогресс-строк.
+				// Пока постобработка активна, считаем процесс живым; после
+				// postprocessTimeout перестаём — зависание всё же убьётся.
+				if ps := postSince.Load(); ps != 0 && time.Since(time.Unix(0, ps)) < postprocessTimeout {
+					lastProgress.Store(time.Now().UnixNano())
+					job.touchData()
+					continue
+				}
 				last := time.Unix(0, lastProgress.Load())
 				if time.Since(last) > stallTimeout && !job.isCancelled() {
 					job.pidMu.Lock()
@@ -397,6 +415,9 @@ func runYtDlp(job *Job, args []string, onProgress func(progressState)) error {
 		// на большом файле и загрузка уходила в бесконечный retry.
 		if isPostprocessActivity(line) {
 			lastProgress.Store(time.Now().UnixNano())
+			if postSince.Load() == 0 {
+				postSince.Store(time.Now().UnixNano())
+			}
 		}
 		parts := strings.Split(line, "|")
 		if len(parts) == 5 && strings.Contains(parts[0], "%") {

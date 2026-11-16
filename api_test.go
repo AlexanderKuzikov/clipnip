@@ -635,6 +635,9 @@ func TestClassifyError(t *testing.T) {
 		"Unsupported URL: ftp://x":          "fatal",
 		"Video unavailable in your country": "fatal",
 		"HTTP Error 404: Not Found":         "fatal",
+		// нет места: повтор упрётся в тот же ENOSPC
+		"OSError: [Errno 28] No space left on device":           "fatal",
+		"not enough free space: need 5.4 GB, free 2.0 GB on E:": "fatal",
 		// сеть
 		"[generic] timed out":                 "network",
 		"stalled: no progress":                "network",
@@ -645,6 +648,26 @@ func TestClassifyError(t *testing.T) {
 		if got := classifyError(msg); got != want {
 			t.Errorf("classifyError(%q) = %q, want %q", msg, got, want)
 		}
+	}
+}
+
+// diskFree — единственный вызов Win32 в этом файле: ошибка в нём не
+// проявится до ремукса 5-гигабайтного файла, поэтому проверяем отдельно.
+func TestDiskFreeReportsSpace(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "probe.mp4")
+	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	free, err := diskFree(p)
+	if err != nil {
+		t.Fatalf("diskFree: %v", err)
+	}
+	if free == 0 {
+		t.Fatal("diskFree returned zero free space")
+	}
+	se := &spaceError{Need: 10 << 30, Free: 1 << 30, Path: `E:\x.mp4`}
+	if msg := se.Error(); !strings.Contains(msg, "not enough free space") || !strings.Contains(msg, "E:") {
+		t.Fatalf("spaceError message = %q", msg)
 	}
 }
 

@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -81,6 +82,15 @@ func (j *Job) isStuck() bool {
 	j.mu.RLock()
 	defer j.mu.RUnlock()
 	return j.Stuck
+}
+
+// touchData — сигнал watchdog'ам, что процесс жив, хотя байты не растут.
+// Нужен на склейке и ремуксе большого файла: yt-dlp и ffmpeg там молчат,
+// а watchdog уровня джоба смотрит только на LastDataAt.
+func (j *Job) touchData() {
+	j.mu.Lock()
+	j.LastDataAt = time.Now()
+	j.mu.Unlock()
 }
 
 func (j *Job) isForced() bool {
@@ -393,7 +403,19 @@ func hasPartial(dir, id string) bool {
 }
 
 func cleanupTempFiles(dir, id string) {
-	for _, pattern := range []string{id + ".*.part", id + ".part", id + ".*.ytdl", id + ".ytdl", id + ".na.tmp.*"} {
+	for _, pattern := range []string{id + ".*.part", id + ".part", id + ".*.ytdl", id + ".ytdl", id + ".temp.*", id + ".*.temp.*", id + ".na.tmp.*", id + ".*.na.tmp.*"} {
+		matches, _ := filepath.Glob(filepath.Join(dir, pattern))
+		for _, p := range matches {
+			os.Remove(p)
+		}
+	}
+}
+
+// cleanupBrokenTemps удаляет недописанные контейнеры: у оборванного
+// .temp.mp4 нет moov (индекс пишется в конце), проиграть его нельзя, а
+// места он занимает как готовый файл. `.part` не трогаем — это докачка.
+func cleanupBrokenTemps(dir, id string) {
+	for _, pattern := range []string{id + ".temp.*", id + ".*.temp.*", id + ".na.tmp.*", id + ".*.na.tmp.*"} {
 		matches, _ := filepath.Glob(filepath.Join(dir, pattern))
 		for _, p := range matches {
 			os.Remove(p)
@@ -586,7 +608,12 @@ func classifyError(msg string) string {
 		strings.Contains(lower, "http error 403"),
 		strings.Contains(lower, "age-restricted"):
 		return errSite
-	case fatalErrRe.MatchString(lower), strings.Contains(lower, "engine components are missing"):
+	case fatalErrRe.MatchString(lower),
+		strings.Contains(lower, "engine components are missing"),
+		// Место на диске не появится от повтора: ретрай только повторяет
+		// ту же запись и снова упирается в ENOSPC.
+		strings.Contains(lower, "no space left on device"),
+		strings.Contains(lower, "not enough free space"):
 		return errFatal
 	default:
 		return errNetwork
@@ -642,7 +669,11 @@ func errorHint(kind, msg string, resumed int64) string {
 		}
 
 	case errFatal:
-		if strings.Contains(strings.ToLower(msg), "engine components are missing") {
+		lower := strings.ToLower(msg)
+		if strings.Contains(lower, "no space left on device") || strings.Contains(lower, "not enough free space") {
+			return "Not enough free disk space to finish the file. Free up space and press Retry — the already downloaded parts stay on disk."
+		}
+		if strings.Contains(lower, "engine components are missing") {
 			if allowRemoteFetch {
 				return "The engine components are not installed. Set the component server address in settings, or put yt-dlp/ffmpeg into the clipnip-bin folder next to the exe."
 			}
@@ -745,6 +776,9 @@ func runDownload(job *Job) {
 	if !started {
 		return
 	}
+	// Хвосты прошлой попытки (оборванный мукс) места не освободят сами:
+	// их нельзя проиграть и они мешают оценить свободное место.
+	cleanupBrokenTemps(dir, job.JobID)
 
 	if job.Title == "" {
 		if title, err := fetchTitle(job.URL); err == nil {
@@ -959,6 +993,7 @@ func runDownload(job *Job) {
 
 	if lastErr != "" {
 		kind := classifyError(lastErr)
+		cleanupBrokenTemps(dir, job.JobID)
 		job.set(func() {
 			job.Status = "error"
 			job.Stage = "error"
@@ -1016,6 +1051,13 @@ func runDownload(job *Job) {
 			return
 		}
 		if err := ensureNoAudio(job, final); err != nil {
+			hint := ""
+			var se *spaceError
+			if errors.As(err, &se) {
+				hint = fmt.Sprintf("Not enough free space to rewrite the video without audio: need %s, free only %s. Free up space and press Retry — the downloaded file stays on disk.",
+					humanBytes(int64(se.Need)), humanBytes(int64(se.Free)))
+				cleanupBrokenTemps(dir, job.JobID)
+			}
 			job.set(func() {
 				if job.Status == "cancelled" || job.Status == "paused" {
 					return
@@ -1023,6 +1065,7 @@ func runDownload(job *Job) {
 				job.Status = "error"
 				job.Stage = "error"
 				job.Error = "Could not remove the audio track: " + err.Error()
+				job.ErrorHint = hint
 			})
 			log.Printf("no-audio strip failed job=%s: %v", job.JobID, err)
 			return
